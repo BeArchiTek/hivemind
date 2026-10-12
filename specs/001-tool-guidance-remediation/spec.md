@@ -43,14 +43,37 @@ Constitution principles cited below are from
 - Q: Must the payload keep only `status` and `message` unchanged with every
   new field additive, or may the `status` vocabulary gain a value such as
   `needs_action`? → A: Additive only. `status` and `message` keep their
-  current values and meaning; every new field (for example `recoverable`,
-  `next_action`, `missing_arguments`) is added alongside. No new status value
-  (FR-027).
+  current values and meaning; every new field (for example `error_kind` and
+  `remediation`) is added alongside. No new status value (FR-027).
 - Q: Do the server instructions replace or complement the project instruction
   block in `docs/AGENT_MEMORY_SETUP.md`? → A: Complement. The block stays, the
   server instructions are added, and a test checks that the two stay
   consistent, because some MCP clients do not show server instructions to the
   model, so the block still covers them (FR-028).
+- Q: Which of today's result statuses are delivered as an MCP error result
+  (`isError=true`)? → A: `error` and `forbidden` only. `not_found` and
+  `partial` stay successful results, because an absent note or document and a
+  partly completed batch are expected answers the agent acts on (FR-026).
+- Q: Do the guidance fields sit inside a `remediation` object or at the top
+  level next to `status` and `message`? → A: Inside a `remediation` object.
+  The top level gains only `error_kind`, `remediation` and, when they apply,
+  `required_permission`, `current_permissions`, `accessible_spaces` and
+  `existing_job`. The existing top-level `next_action` field stays only on the
+  consolidation acknowledgement (FR-003, FR-027).
+- Q: How is SC-004 verified, given that a scripted client cannot show a
+  change in agent behaviour and a real model needs credentials the nominal
+  suite must not have? → A: As a separate, opt-in evaluation with a real model
+  and its own credentials, outside the nominal suite, with its result
+  recorded in the pull request. The nominal suite only checks that the
+  instructions contain each FR-013 rule (FR-015, SC-004).
+- Q: Should operators be able to view which kinds of refusals agents hit? →
+  A: Yes. Each refusal records its `error_kind` in the audit log entry, and a
+  Prometheus counter counts refusals by tool and `error_kind`. No argument
+  values or remediation text are recorded (FR-030).
+- Q: How does the change to MCP error results reach existing deployments? →
+  A: On by default, with a startup setting that restores today's delivery for
+  now. A later release removes the setting and the new delivery becomes the
+  only behaviour; that release is not decided yet (FR-031).
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -159,9 +182,10 @@ file and makes the rules the same for every client, but the agent can already
 get the rules from `docs/AGENT_MEMORY_SETUP.md` and `space_rules`.
 
 **Independent Test**: Initialize an MCP session with a `read,write` token and
-verify that the returned instructions contain each rule listed in FR-013, and
+verify that the returned instructions contain each rule listed in FR-013
+(nominal suite). Separately, an opt-in evaluation with a real model verifies
 that an agent given only these instructions performs the start-of-task calls
-before its first mutation in a scripted session.
+before its first mutation (SC-004).
 
 **Acceptance Scenarios**:
 
@@ -352,13 +376,21 @@ Verification
 - **FR-025**: Existing tests that assert `{"status": "error", "message": ...}`
   MUST keep passing without edits to their assertions on `status` and
   `message`.
-- **FR-026**: A refused call MUST be delivered as an MCP error result with
-  `isError=true` whose content carries the Guidance error payload as JSON
-  text. A successful call keeps today's delivery.
+- **FR-026**: A refused call, meaning a result whose `status` is `error` or
+  `forbidden`, MUST be delivered as an MCP error result with `isError=true`
+  whose content carries the Guidance error payload as JSON text. Results whose
+  `status` is `not_found` or `partial` are not refusals: they keep today's
+  successful delivery, and they may carry a `remediation` object when a next
+  step exists. Every other result keeps today's delivery.
 - **FR-027**: The payload MUST keep `status` and `message` with their current
-  values and meaning; every new field (for example `recoverable`,
-  `next_action`, `error_kind`, `remediation`, `missing_arguments`) MUST be
-  added alongside them. The `status` vocabulary MUST NOT gain a new value.
+  values and meaning. The new top-level fields are only `error_kind`,
+  `remediation` and, when they apply, `required_permission`,
+  `current_permissions`, `accessible_spaces` and `existing_job`; they MUST be
+  added alongside `status` and `message`. Every other guidance field
+  (`next_tool`, `arguments`, `missing_arguments`, `required_prior_step`,
+  `reason`, `retryable`) MUST sit inside the `remediation` object (FR-003).
+  The top-level `next_action` field stays only on the consolidation
+  acknowledgement. The `status` vocabulary MUST NOT gain a new value.
 - **FR-028**: The server instructions MUST complement, not replace, the
   project instruction block in `docs/AGENT_MEMORY_SETUP.md:89-166`. The block
   stays because some MCP clients do not show server instructions to the model.
@@ -376,10 +408,33 @@ Verification
     (`tools/hivemind-ingest/internal/mcpclient/client.go:410-448`).
   No client may lose the `message` it displays today.
 
+Observability
+
+- **FR-030**: Every refused call MUST record its `error_kind` in the audit log
+  entry that `AuditMiddleware` writes for the call, and MUST increment a
+  Prometheus counter exposed by `MetricsMiddleware` whose labels are the
+  canonical tool name and `error_kind` only. Because `error_kind` comes from
+  the closed set in FR-002 and tool names from the exposure registry, the
+  number of label values is bounded. Neither the audit entry nor the metric
+  may contain argument values, remediation text, space identifiers or tokens
+  (constitution principles IV and VII).
+
+Rollout
+
+- **FR-031**: The delivery in FR-026 MUST be on by default. A startup setting
+  in `Settings` (`src/live_mem/config.py`), validated at startup, MUST let an
+  operator restore today's delivery: refused calls return a successful MCP
+  result with the same Guidance error payload. The setting changes only the
+  `isError` flag; the payload, the audit entry and the metric (FR-030) stay
+  the same. `CHANGELOG.md` and `docs/DEPLOYMENT.md` MUST describe the change,
+  the setting, and that a later release removes the setting so that the
+  delivery in FR-026 becomes the only behaviour. Which release removes it is
+  not decided yet.
+
 ### Key Entities
 
 - **Guidance error payload**: the dict a refused tool call returns. Fields:
-  `status` (existing, `error`), `message` (existing, one sentence stating the
+  `status` (existing, `error` or `forbidden`), `message` (existing, one sentence stating the
   cause), `error_kind` (one value from the closed set in FR-002),
   `remediation` (object: `next_tool`, `arguments`, `missing_arguments`,
   `required_prior_step`, `reason`, `retryable`), and, when they apply,
@@ -414,11 +469,13 @@ Verification
 - **SC-003**: 100% of the 24 `agent_core` tool descriptions and 100% of their
   parameters pass the description contract check; every discovery profile
   stays within the documented discovery budget.
-- **SC-004**: An agent given only the server instructions, in a scripted
-  session with a `read,write` token, performs `space_rules`, `mid_read_all`
+- **SC-004**: In an opt-in evaluation that runs a real model with its own
+  credentials outside the nominal suite, an agent given only the server
+  instructions, with a `read,write` token, performs `space_rules`, `mid_read_all`
   and `short_read` before its first `short_note`, writes notes only in the
   seven categories, calls `mid_consolidate` once, and makes no status call
-  afterwards, in 10 of 10 scripted runs.
+  afterwards, in 10 of 10 runs. The pull request records the model used and
+  the result of each run.
 - **SC-005**: The existing nominal test suite passes with no change to any
   assertion on `status` or `message`, and the CLI, admin console and
   `hivemind-ingest` display refused calls exactly as they do in 1.6.1.
