@@ -74,6 +74,12 @@ Constitution principles cited below are from
   A: On by default, with a startup setting that restores today's delivery for
   now. A later release removes the setting and the new delivery becomes the
   only behaviour; that release is not decided yet (FR-031).
+- Q: How is the payload carried in the MCP error result, and what happens for a
+  tool name that is not registered? → A: The payload travels both as
+  `structuredContent` and as JSON text in `content`. Tools return the result
+  object themselves, because the SDK's `ToolError` keeps only a text message. A
+  tool name that is not registered receives the SDK's "Unknown tool" result;
+  this feature does not change it (FR-026).
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -377,8 +383,23 @@ Verification
   MUST keep passing without edits to their assertions on `status` and
   `message`.
 - **FR-026**: A refused call, meaning a result whose `status` is `error` or
-  `forbidden`, MUST be delivered as an MCP error result with `isError=true`
-  whose content carries the Guidance error payload as JSON text. Results whose
+  `forbidden`, MUST be delivered as an MCP error result with `isError=true`.
+  This follows the MCP specification, which reports business logic errors and
+  input validation errors as tool execution errors with `isError: true` so that
+  the model can correct itself
+  ([MCP 2025-11-25, Tools, Error Handling](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#error-handling)).
+  The result MUST carry the Guidance error payload twice: as
+  `structuredContent`, and as the same JSON serialized in a text item of
+  `content`, as the MCP specification recommends for structured results.
+  The tool MUST return this result object itself and MUST NOT raise the SDK's
+  `ToolError`, because the SDK turns a `ToolError` into a result that carries
+  only the message text (`mcp/server/mcpserver/server.py:456`, mcp 2.3.0). The
+  SDK does not validate an error result against the tool's output schema on
+  the server or on the client (`mcp/server/mcpserver/utilities/func_metadata.py:204-206`,
+  `mcp/client/session.py:1101`), so the payload does not need to match the
+  success schema. A call to a tool name that is not registered receives the
+  SDK's "Unknown tool" result, which this feature does not change; hidden
+  operator tools stay registered, so their refusals carry the payload. Results whose
   `status` is `not_found` or `partial` are not refusals: they keep today's
   successful delivery, and they may carry a `remediation` object when a next
   step exists. Every other result keeps today's delivery.
