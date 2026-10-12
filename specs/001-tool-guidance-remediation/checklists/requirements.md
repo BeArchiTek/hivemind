@@ -13,7 +13,7 @@
 
 ## Requirement Completeness
 
-- [ ] No [NEEDS CLARIFICATION] markers remain
+- [x] No [NEEDS CLARIFICATION] markers remain
 - [x] Requirements are testable and unambiguous
 - [x] Success criteria are measurable
 - [x] Success criteria are technology-agnostic (no implementation details)
@@ -31,10 +31,10 @@
 
 ## Notes
 
-- Three [NEEDS CLARIFICATION] markers remain, on FR-026 (MCP error result or
-  successful result), FR-027 (additive fields only, or a new `status` value)
-  and FR-028 (server instructions replace or complement the client-side
-  instruction block). They must be answered with `/speckit-clarify` before
+- The three [NEEDS CLARIFICATION] markers (FR-026, FR-027, FR-028) were
+  answered on 2026-10-12 and recorded under "Clarifications" in spec.md; the
+  requirement text was updated in place and FR-029 was added for the client
+  check the planning stage must perform. The specification is ready for
   `/speckit-plan`.
 - "No implementation details" is marked satisfied with one reservation: the
   specification names existing Hivemind tool names, field names and file

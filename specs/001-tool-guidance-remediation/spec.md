@@ -22,14 +22,35 @@ and receives no server instructions at initialize
 ([research.md](research.md), "Gaps this specification must close"). What is
 needed is one error shape with a structured remediation, descriptions that
 carry purpose, preconditions, required permission and peer tools, and server
-instructions that carry the memory-bank workflow. Not decided: whether a
-remediation error travels as an MCP error result or as a successful result,
-how much of the current error shape must stay unchanged for existing clients,
-and whether the server instructions replace or complement the client-side
-instruction block.
+instructions that carry the memory-bank workflow. Decided on 2026-10-12 (see
+Clarifications): a refused call travels as an MCP error result with
+`isError=true` carrying the JSON payload; `status` and `message` keep their
+current values and every new field is additive; the server instructions
+complement the client-side instruction block, which stays.
 
 Constitution principles cited below are from
 [`.specify/memory/constitution.md`](../../.specify/memory/constitution.md).
+
+## Clarifications
+
+### Session 2026-10-12
+
+- Q: Is a refused call delivered as a successful MCP result whose content is
+  the payload, or as an MCP error result with `isError=true`? → A: As an MCP
+  error result with `isError=true`, carrying the same JSON payload in its
+  content. The planning stage must check every client that reads tool results
+  so none of them breaks (FR-026, FR-029).
+- Q: Must the payload keep only `status` and `message` unchanged with every
+  new field additive, or may the `status` vocabulary gain a value such as
+  `needs_action`? → A: Additive only. `status` and `message` keep their
+  current values and meaning; every new field (for example `recoverable`,
+  `next_action`, `missing_arguments`) is added alongside. No new status value
+  (FR-027).
+- Q: Do the server instructions replace or complement the project instruction
+  block in `docs/AGENT_MEMORY_SETUP.md`? → A: Complement. The block stays, the
+  server instructions are added, and a test checks that the two stay
+  consistent, because some MCP clients do not show server instructions to the
+  model, so the block still covers them (FR-028).
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -166,7 +187,8 @@ before its first mutation in a scripted session.
 An operator using the Hivemind CLI, the admin console or `hivemind-ingest`
 receives errors with the same fields as an agent does: the cause, a stable
 error kind, and the remediation. Existing displays that show `message`
-continue to work; displays can additionally show the remediation.
+continue to work after refused calls become MCP error results; displays can
+additionally show the remediation.
 
 **Why this priority**: Consistency across clients lowers support effort, but
 the existing clients already work with `status` and `message`.
@@ -330,21 +352,29 @@ Verification
 - **FR-025**: Existing tests that assert `{"status": "error", "message": ...}`
   MUST keep passing without edits to their assertions on `status` and
   `message`.
-- **FR-026**: Errors MUST be delivered [NEEDS CLARIFICATION: as a successful
-  MCP result whose content is the payload (today's behaviour, which the CLI
-  and the admin console parse), or as an MCP error result with `isError=true`
-  carrying the same payload (which `hivemind-ingest` already maps to `status:
-  error`)? The choice decides whether the CLI and console need a change.]
-- **FR-027**: The payload MUST keep [NEEDS CLARIFICATION: only `status` and
-  `message` unchanged, with every new field additive (no test or client
-  changes), or may the `status` vocabulary gain a value such as `needs_action`
-  for recoverable refusals, which the 56 test files and the three clients
-  would then have to handle?]
-- **FR-028**: The server instructions MUST [NEEDS CLARIFICATION: replace the
-  project instruction block in `docs/AGENT_MEMORY_SETUP.md:89-166` (the block
-  shrinks to the space identifier and deployment values), or complement it
-  (the block stays and the two must be kept consistent by a documented
-  check)?]
+- **FR-026**: A refused call MUST be delivered as an MCP error result with
+  `isError=true` whose content carries the Guidance error payload as JSON
+  text. A successful call keeps today's delivery.
+- **FR-027**: The payload MUST keep `status` and `message` with their current
+  values and meaning; every new field (for example `recoverable`,
+  `next_action`, `error_kind`, `remediation`, `missing_arguments`) MUST be
+  added alongside them. The `status` vocabulary MUST NOT gain a new value.
+- **FR-028**: The server instructions MUST complement, not replace, the
+  project instruction block in `docs/AGENT_MEMORY_SETUP.md:89-166`. The block
+  stays because some MCP clients do not show server instructions to the model.
+  A contract test MUST fail when a rule named in FR-013 is present in one of
+  the two and absent or contradicted in the other.
+- **FR-029**: Before implementation, the planning stage MUST check every
+  client that reads tool results and record the result for each:
+  - the Hivemind CLI, which reads `content[0].text` whatever `isError` says
+    (`scripts/cli/client.py:100-108`);
+  - the admin console, which calls tools through the `/api/tool` proxy, not
+    through MCP (`src/live_mem/tools/__init__.py:83-137`), so the proxy's
+    rendering of an error result must be checked;
+  - `hivemind-ingest`, which maps `isError: true` to `status: error` and must
+    still expose the payload's fields
+    (`tools/hivemind-ingest/internal/mcpclient/client.go:410-448`).
+  No client may lose the `message` it displays today.
 
 ### Key Entities
 
