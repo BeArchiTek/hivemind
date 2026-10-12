@@ -23,8 +23,12 @@ stay as they are; `safe_error` and the guard helpers in
 `src/live_mem/auth/context.py` gain `error_kind` and `remediation`; the
 audit entry and a Prometheus counter receive the kind through the ASGI
 request state; a startup setting `MCP_REFUSAL_IS_ERROR` restores today's
-delivery. Not decided: six open questions listed under "Risks and open
-questions".
+delivery. Decided on 2026-10-12 after the plan review: one server-level
+conversion (handlers keep returning dicts), `bank_compact`'s string
+`remediation` moves into `remediation.reason`, `conflict` stays a successful
+result with guidance fields, and `required_prior_step_missing` stays in the
+closed set without a producer. Not decided: the byte cap of the instructions
+and the `error_kind` of the missing `client_name` refusal (Q4, Q6).
 
 ## Technical Context
 
@@ -107,9 +111,10 @@ Principles from [`.specify/memory/constitution.md`](../../.specify/memory/consti
 Gate result before Phase 0: pass, no violation to justify.
 
 Gate result after Phase 1 design: pass. The design added one closed-set
-value (`unclassified_refusal`) beyond the FR-002 minimum and one reserved
-value (`operator_tool_refused`); both are additive and documented. No
-principle is violated; Complexity Tracking stays empty.
+value (`unclassified_refusal`) beyond the FR-002 minimum and two reserved
+values from specification 002 (`operator_tools_refused`,
+`audience_unresolved`); all are additive and documented. No principle is
+violated; Complexity Tracking stays empty.
 
 ## Project Structure
 
@@ -155,12 +160,12 @@ src/live_mem/
     ├── live.py                     # category refusal gains error_kind="invalid_argument"
     └── consolidation_queue.py      # existing-job acknowledgement gains existing_job (FR-007)
 
-scripts/cli/                        # no change required (research.md, Item 1); optional remediation display later
+scripts/cli/display.py              # show_bank_compact_failure reads remediation.reason instead of the string (lines 707, 778)
 tools/hivemind-ingest/              # no change required (research.md, Item 1)
 src/live_mem/static/js/admin-api.js # no change required (research.md, Item 1)
 
 docs/
-├── MCP_TOOLS_SPEC.md               # payload, closed set with one example each (FR-012)
+├── MCP_TOOLS_SPEC.md               # payload, closed set with one example each (FR-012); `conflict` added to the statuses
 ├── DEPLOYMENT.md                   # new subsection under Production for MCP_REFUSAL_IS_ERROR (FR-031)
 └── AGENT_MEMORY_SETUP.md           # unchanged block (FR-028); one sentence noting the server instructions
 .env.example                        # MCP_REFUSAL_IS_ERROR=true in the MCP server block
@@ -201,7 +206,11 @@ Full evidence is in [research.md](research.md), "Plan-stage research
    of `call_tool` on `HivemindMCPServer`, which covers aliases and hidden
    operator tools and also catches the SDK's input-schema `ToolError`. The
    56 test files reach handlers through `.fn`, through service classes, or
-   through clients that parse the text item, so FR-025 holds.
+   through clients that parse the text item, so FR-025 holds. Confirmed:
+   handlers keep returning dicts and the `/api/tool` path is unchanged.
+   `bank_compact`'s string `remediation` moves into `remediation.reason`;
+   the CLI reader `show_bank_compact_failure` (`scripts/cli/display.py:707`,
+   printed at `display.py:778`) changes in the same pull request.
 3. Instructions. `HivemindMCPServer(...)` passes none
    (`src/live_mem/server.py:249-254`); the SDK accepts and sends the string
    (`mcp/server/mcpserver/server.py:163,216`; `mcp/server/lowlevel/server.py:562`).
@@ -211,9 +220,11 @@ Full evidence is in [research.md](research.md), "Plan-stage research
 4. Closed set grounded in the refusal sites: `authentication_missing`,
    `token_scope_changed`, `invalid_space_id`, `space_access_denied`,
    `permission_insufficient`, `missing_argument`, `invalid_argument`,
-   `required_prior_step_missing` (no producer today), `operation_in_progress`
-   (`conflict` results, open), `write_route_refused`, `internal_failure`,
-   `operator_tool_refused` (reserved for specification 002),
+   `required_prior_step_missing` (no producer today; excluded from the
+   replay test until one exists), `operation_in_progress` (`conflict`
+   results, which stay successful results with `retryable=true`),
+   `write_route_refused`, `internal_failure`, `operator_tools_refused` and
+   `audience_unresolved` (reserved for specification 002),
    `unclassified_refusal` (drift indicator).
 5. Audit and metrics. Both middlewares are ASGI-level and know no tool
    name; the tool call runs outside the request task, so the value travels
@@ -247,10 +258,32 @@ Agent context update: the `speckit-plan` skill in this repository lists no
 agent-context script and `.specify/scripts/bash/` contains none, so no
 agent context file was updated.
 
+## Alignment with specification 002 (operator tool guard)
+
+Specification 002 is implemented on branch `spec/002-operator-tool-guard`
+(commit e01154b, read from `/home/user/hivemind-operator`). It adds its own
+override of `HivemindMCPServer.call_tool` (its
+`src/live_mem/tools/exposure.py:1082-1099`) that returns the operator
+refusal through `tool.fn_metadata.convert_result(refusal)` before calling
+`super().call_tool`, and a matching check in `call_tool_direct` for
+`/api/tool` (its `src/live_mem/tools/__init__.py:107-118`). When the
+branches meet:
+
+- this feature's conversion is added to that same override, not to a
+  second override;
+- the 002 guard runs before the conversion, and its `forbidden` refusal
+  dict passes through the conversion like any other refusal, so the agent
+  views an MCP error result with `error_kind` `operator_tools_refused` or
+  `audience_unresolved` and `remediation.retryable=false`;
+- the 002 constants `OPERATOR_TOOLS_REFUSED` and `AUDIENCE_UNRESOLVED`
+  (its `exposure.py:973-974`) are the source of the two reserved
+  `error_kind` values; this feature does not redefine them.
+
 ## Risks and open questions
 
-Recorded in [research.md](research.md), "Risks" (R1 to R5) and "Open
-questions the plan cannot settle" (Q1 to Q6). In short:
+Recorded in [research.md](research.md), "Risks" (R1 to R5), "Questions
+decided on 2026-10-12" (Q1, Q2, Q3, Q5) and "Open questions the plan cannot
+settle" (Q4, Q6). In short:
 
 - R1: `scope["state"]` must be the same dict in the SDK task and the
   middleware; the first observability test proves it or the fallback
@@ -261,13 +294,17 @@ questions the plan cannot settle" (Q1 to Q6). In short:
   measured yet.
 - R4: input-schema failures depend on pydantic error locations.
 - R5: `hivemind-ingest` would show a future `forbidden` as `error`.
-- Q1: `bank_compact`'s string `remediation` versus the new object.
-- Q2: no producer for `required_prior_step_missing` in 1.6.1.
-- Q3: whether `conflict` results carry guidance or become refusals.
-- Q4: the byte cap of the instructions.
-- Q5: confirmation that "tools return the result object themselves" means
-  one server-level conversion, not per-handler `CallToolResult` returns.
-- Q6: the `error_kind` for the missing `client_name` identity refusal.
+- Q1 (decided): `bank_compact`'s string `remediation` moves into
+  `remediation.reason`; the CLI reader changes in the same pull request.
+- Q2 (decided): `required_prior_step_missing` stays in the closed set
+  without a producer and outside the replay test.
+- Q3 (decided): `conflict` stays a successful result that carries
+  `error_kind="operation_in_progress"` and `retryable=true`, and is added to
+  the documented statuses.
+- Q4 (open): the byte cap of the instructions.
+- Q5 (decided): one server-level conversion; handlers keep returning dicts;
+  `/api/tool` unchanged.
+- Q6 (open): the `error_kind` for the missing `client_name` identity refusal.
 
 ## Complexity Tracking
 

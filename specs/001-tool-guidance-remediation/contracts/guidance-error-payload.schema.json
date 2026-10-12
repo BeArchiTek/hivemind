@@ -4,11 +4,21 @@
   "title": "Guidance error payload",
   "description": "The dict a refused Hivemind tool call returns. status and message keep their 1.6.1 values; every other field is additive (spec.md FR-001, FR-003, FR-027). Existing per-tool fields such as reason, failure_reason, recovery_required and rejected_volatile are allowed and unchanged.",
   "type": "object",
-  "required": ["status", "message", "error_kind", "remediation"],
+  "required": [
+    "status",
+    "message",
+    "error_kind",
+    "remediation"
+  ],
   "properties": {
     "status": {
       "type": "string",
-      "enum": ["error", "forbidden"]
+      "enum": [
+        "error",
+        "forbidden",
+        "conflict"
+      ],
+      "description": "error or forbidden for a refusal; conflict for the successful result that carries error_kind operation_in_progress."
     },
     "message": {
       "type": "string",
@@ -28,13 +38,17 @@
         "operation_in_progress",
         "write_route_refused",
         "internal_failure",
-        "operator_tool_refused",
+        "operator_tools_refused",
+        "audience_unresolved",
         "unclassified_refusal"
       ]
     },
     "remediation": {
       "type": "object",
-      "required": ["reason", "retryable"],
+      "required": [
+        "reason",
+        "retryable"
+      ],
       "properties": {
         "next_tool": {
           "type": "string",
@@ -46,7 +60,9 @@
         },
         "missing_arguments": {
           "type": "array",
-          "items": {"type": "string"},
+          "items": {
+            "type": "string"
+          },
           "minItems": 1
         },
         "required_prior_step": {
@@ -64,15 +80,30 @@
     },
     "required_permission": {
       "type": "string",
-      "enum": ["read", "write", "manage", "admin"]
+      "enum": [
+        "read",
+        "write",
+        "manage",
+        "admin"
+      ]
     },
     "current_permissions": {
       "type": "array",
-      "items": {"type": "string", "enum": ["read", "write", "manage", "admin"]}
+      "items": {
+        "type": "string",
+        "enum": [
+          "read",
+          "write",
+          "manage",
+          "admin"
+        ]
+      }
     },
     "accessible_spaces": {
       "type": "array",
-      "items": {"type": "string"}
+      "items": {
+        "type": "string"
+      }
     },
     "existing_job": {
       "type": "object",
@@ -81,23 +112,128 @@
   },
   "allOf": [
     {
-      "if": {"properties": {"error_kind": {"const": "permission_insufficient"}}},
+      "if": {
+        "properties": {
+          "error_kind": {
+            "const": "permission_insufficient"
+          }
+        }
+      },
       "then": {
-        "required": ["required_permission", "current_permissions"],
-        "properties": {"remediation": {"not": {"required": ["next_tool"]}}}
+        "required": [
+          "required_permission",
+          "current_permissions"
+        ],
+        "properties": {
+          "remediation": {
+            "not": {
+              "required": [
+                "next_tool"
+              ]
+            }
+          }
+        }
       }
     },
     {
-      "if": {"properties": {"error_kind": {"const": "space_access_denied"}}},
+      "if": {
+        "properties": {
+          "error_kind": {
+            "const": "space_access_denied"
+          }
+        }
+      },
       "then": {
-        "required": ["accessible_spaces"],
-        "properties": {"remediation": {"properties": {"next_tool": {"const": "space_list"}}, "required": ["next_tool"]}}
+        "required": [
+          "accessible_spaces"
+        ],
+        "properties": {
+          "remediation": {
+            "properties": {
+              "next_tool": {
+                "const": "space_list"
+              }
+            },
+            "required": [
+              "next_tool"
+            ]
+          }
+        }
       }
     },
     {
-      "if": {"properties": {"error_kind": {"enum": ["missing_argument", "invalid_argument"]}}},
+      "if": {
+        "properties": {
+          "error_kind": {
+            "enum": [
+              "missing_argument",
+              "invalid_argument"
+            ]
+          }
+        }
+      },
       "then": {
-        "properties": {"remediation": {"required": ["missing_arguments"]}}
+        "properties": {
+          "remediation": {
+            "required": [
+              "missing_arguments"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "conflict"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "error_kind": {
+            "const": "operation_in_progress"
+          },
+          "remediation": {
+            "properties": {
+              "retryable": {
+                "const": true
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "error_kind": {
+            "enum": [
+              "operator_tools_refused",
+              "audience_unresolved"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "const": "forbidden"
+          },
+          "remediation": {
+            "properties": {
+              "retryable": {
+                "const": false
+              }
+            },
+            "not": {
+              "required": [
+                "next_tool"
+              ]
+            }
+          }
+        }
       }
     }
   ]

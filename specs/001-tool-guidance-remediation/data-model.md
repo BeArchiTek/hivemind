@@ -6,9 +6,8 @@ adds, next to those two fields, a stable `error_kind` and a structured
 `remediation` object, and records the kind in the audit log and a Prometheus
 counter. The server instructions and the tool description contract are text
 entities built from fixed rule records and from the exposure registry. Not
-decided: the shape of `bank_compact`'s existing string `remediation`, whether
-`conflict` results carry guidance, and the byte cap of the instructions
-(see [research.md](research.md), "Open questions the plan cannot settle").
+decided: the byte cap of the instructions (see [research.md](research.md),
+"Open questions the plan cannot settle").
 
 Line references are to commit 3b2db17 unless a path under `.venv/` is given.
 
@@ -20,9 +19,11 @@ The dict a refused tool call returns. It extends today's error dict
 
 Fields:
 
-- `status` (existing, string): `error` or `forbidden`. Unchanged value and
-  meaning (FR-027). No code returns `forbidden` today; the value stays
-  accepted because `docs/MCP_TOOLS_SPEC.md:118` documents it.
+- `status` (existing, string): `error` or `forbidden` for a refusal.
+  Unchanged value and meaning (FR-027). No code returns `forbidden` today
+  outside specification 002; the value stays accepted because
+  `docs/MCP_TOOLS_SPEC.md:118` documents it. A `conflict` result carries the
+  same guidance fields with `status="conflict"` and successful delivery.
 - `message` (existing, string): one sentence stating the cause, built from
   server-owned text. Unchanged value for every existing refusal site.
 - `error_kind` (new, string): one value from the closed set below.
@@ -42,11 +43,15 @@ Fields:
 
 Existing fields that some refusals already carry stay unchanged: `reason`
 (`src/live_mem/tools/admin.py:753`), `failure_reason`, `failed_phase`,
-`rollback_outcome`, `failures` and the string `remediation` of `bank_compact`
-(`src/live_mem/tools/bank.py:60-80`; open question Q1), `recovery_required`
+`rollback_outcome` and `failures` of `bank_compact`
+(`src/live_mem/tools/bank.py:60-80`), `recovery_required`
 (`src/live_mem/core/memory_id.py:57`), `rejected_volatile`
 (`src/live_mem/tools/graph.py:878`), `mcp_reconnect_required`
-(`src/live_mem/core/tokens.py:604`).
+(`src/live_mem/core/tokens.py:604`). One existing field changes shape:
+`bank_compact`'s top-level string `remediation` (`src/live_mem/tools/bank.py:72`)
+moves into `remediation.reason`, so every tool has the same `remediation`
+object; the CLI reader (`scripts/cli/display.py:707,778`) changes in the
+same pull request.
 
 Validation rules:
 
@@ -54,6 +59,9 @@ Validation rules:
   site returned in 1.6.1 (FR-025, SC-005).
 - `error_kind` is required on every refusal; a refusal without it receives
   `unclassified_refusal` at the conversion point and fails the replay test.
+- A `conflict` result carries `error_kind="operation_in_progress"` and a
+  `remediation` object but keeps `status="conflict"` and successful
+  delivery; it is not a refusal.
 - `message` and every string inside `remediation` are built from literals in
   Hivemind's source, tool names, argument names, permission names and the
   token's own space identifiers; never from exception text, storage paths or
@@ -94,7 +102,8 @@ Validation rules:
 - At least one of `next_tool`, `arguments`, `missing_arguments`,
   `required_prior_step` is present unless the refusal names an operator action
   (`permission_insufficient`, `write_route_refused`, `internal_failure`,
-  `operator_tool_refused`), where `reason` carries the operator workflow.
+  `operator_tools_refused`, `audience_unresolved`), where `reason` carries
+  the operator workflow.
 
 ## Closed set of `error_kind` values
 
@@ -113,16 +122,20 @@ Grounded in the refusal sites listed in [research.md](research.md), Item 4.
 - `missing_argument`: a required argument or confirmation flag is absent.
 - `invalid_argument`: an argument is outside its allowed values or format.
 - `required_prior_step_missing`: a prior tool call or operator action has not
-  happened (no producer in 1.6.1; open question Q2).
+  happened. No tool produces it yet; it is excluded from the replay test
+  until one does.
 - `operation_in_progress`: an operation on the same space is queued or
-  running (open question Q3 for `conflict` results).
+  running. Produced by `conflict` results, which stay successful results
+  (not `isError`) with `remediation.retryable=true`.
 - `write_route_refused`: the space is shared, in recovery, or its critical
   state is corrupt (`src/live_mem/tools/admin.py:751-777`;
   `src/live_mem/tools/bank.py:1412-1437`; `src/live_mem/tools/live.py:118-134`).
 - `internal_failure`: an unexpected exception rendered by `safe_error`
   (`src/live_mem/auth/context.py:415-438`).
-- `operator_tool_refused`: reserved for specification 002; not produced by
-  this feature.
+- `operator_tools_refused`: reserved for specification 002 (the token is
+  not allowed operator tools); not produced by this feature.
+- `audience_unresolved`: reserved for specification 002 (a registered tool
+  with no registry entry); not produced by this feature.
 - `unclassified_refusal`: assigned by the conversion point to a refusal
   without `error_kind`; a defect indicator, never a designed outcome.
 

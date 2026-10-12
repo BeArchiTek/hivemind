@@ -520,15 +520,20 @@ handlers. The mapping below is the decision for the closed set.
   `admin.py:713`; the note category check
   (`src/live_mem/core/live.py:99-106`).
 - `required_prior_step_missing`: no refusal site in 1.6.1 returns this
-  cause (open question Q2).
+  cause. Decided: the value stays in the closed set, documented as having
+  no producer yet, and the replay test excludes it until a tool produces
+  it.
 - `operation_in_progress`: the consolidation queue returns the existing
   job's payload instead of an error (`src/live_mem/core/consolidation_queue.py:164-166`,
   FR-007). `bank_compact` returns `"status": "conflict"` while a
   consolidation lock is held (`src/live_mem/tools/bank.py:1365-1372`), and
   `admin_gc_notes` does the same (`src/live_mem/core/gc.py:420,679,700,722`).
   `conflict` is not in the documented status list
-  (`docs/MCP_TOOLS_SPEC.md:108-121`) and is not `error` or `forbidden`, so
-  FR-026 keeps it a successful result (open question Q3).
+  (`docs/MCP_TOOLS_SPEC.md:108-121`) and is not `error` or `forbidden`.
+  Decided: `conflict` stays a successful result (not `isError`) that
+  carries `error_kind="operation_in_progress"` and a `remediation` with
+  `retryable=true`; `conflict` is added to the documented statuses in
+  `docs/MCP_TOOLS_SPEC.md`.
 - `write_route_refused`: `StagedWriteNotImplemented` from `short_note`
   (`src/live_mem/tools/live.py:118-134`); `admin.py:751-777` (`reason`
   values `route_staged_not_implemented`, `route_refused`, `state_corrupt`);
@@ -538,9 +543,17 @@ handlers. The mapping below is the decision for the closed set.
   crash result (`consolidation_queue.py:432-434`); the proxy-only results
   "Server not initialized", "Unknown tool", "internal error"
   (`src/live_mem/tools/__init__.py:99,105,122`).
-- `operator_tool_refused`: reserved. Specification 002, written on another
-  branch, will add a refusal for operator tools; this feature reserves the
-  value and does not produce it.
+- `operator_tools_refused` and `audience_unresolved`: reserved for
+  specification 002 (branch `spec/002-operator-tool-guard`, commit
+  e01154b). That branch defines the cause constants
+  `OPERATOR_TOOLS_REFUSED = "operator_tools_refused"` and
+  `AUDIENCE_UNRESOLVED = "audience_unresolved"` (the second for a
+  registered tool with no registry entry) and the refusal
+  `{"status": "forbidden", "message": "This tool is reserved for operators.
+  Ask an operator to perform the action through the admin console or the
+  CLI with an operator token."}` (its `src/live_mem/tools/exposure.py:973-983`).
+  That refusal names no corrective call; `remediation.retryable` is false.
+  This feature reserves both values and does not produce them.
 - `unclassified_refusal`: assigned by the conversion point to a refusal
   whose dict carries no `error_kind`. It exists so that drift is visible
   (in the Prometheus counter) and testable (the replay test fails on it),
@@ -549,8 +562,13 @@ handlers. The mapping below is the decision for the closed set.
 Existing field names that overlap: `reason` (`admin.py:753`),
 `failure_reason` (`bank.py:63`), free-text `remediation` (`bank.py:72`),
 `recovery_required` (`memory_id.py:57`), `rejected_volatile`
-(`graph.py:878`). They stay as they are (additive rule, FR-027); open
-question Q1 covers `bank_compact`'s string `remediation`.
+(`graph.py:878`). They stay as they are (additive rule, FR-027), with one
+exception decided on 2026-10-12: `bank_compact`'s top-level string
+`remediation` (`bank.py:72`) moves into `remediation.reason`, so every tool
+has the same shape. The CLI reads that string in
+`show_bank_compact_failure` (`scripts/cli/display.py:707`, printed at
+`display.py:778`); the same pull request changes it to read
+`remediation.reason`.
 
 ### Item 5. Audit and metrics integration points
 
@@ -674,29 +692,47 @@ question Q1 covers `bank_compact`'s string `remediation`.
   (`client.go:425`). Today no tool returns `forbidden`; if one does in the
   future, that client shows `error`.
 
+### Questions decided on 2026-10-12 (spec.md, "Clarifications")
+
+- Q1. `bank_compact`'s top-level string `remediation`
+  (`src/live_mem/tools/bank.py:72,1412-1437`) moves into
+  `remediation.reason`; the CLI reader (`scripts/cli/display.py:707,778`)
+  changes in the same pull request.
+- Q2. `required_prior_step_missing` stays in the closed set, documented as
+  having no producer yet, and is excluded from the replay test until a tool
+  produces it.
+- Q3. `"status": "conflict"` (`bank.py:1365-1372`; `gc.py:420,679,700,722`)
+  stays a successful result that carries `error_kind="operation_in_progress"`
+  and a `remediation` with `retryable=true`; `conflict` is added to the
+  documented statuses in `docs/MCP_TOOLS_SPEC.md:108-121`.
+- Q5. Confirmed: handlers keep returning dicts and
+  `HivemindMCPServer.call_tool` converts every refusal into a
+  `CallToolResult(is_error=True)` with `structuredContent` and JSON text;
+  the `/api/tool` path stays unchanged.
+
+### Alignment with specification 002 (operator tool guard)
+
+Read from the worktree `/home/user/hivemind-operator`, branch
+`spec/002-operator-tool-guard`, commit e01154b:
+
+- It adds its own override of `HivemindMCPServer.call_tool`
+  (`src/live_mem/tools/exposure.py:1082-1099` there): it looks the tool up,
+  reads the request identity, and when `operator_tool_refusal(...)` returns
+  a refusal, returns `tool.fn_metadata.convert_result(refusal)` (a
+  successful result with `status: forbidden`); otherwise it calls
+  `super().call_tool`.
+- It adds the same guard to `call_tool_direct` for `/api/tool`
+  (`src/live_mem/tools/__init__.py:107-118` there).
+- When the branches meet, this feature's conversion must be added to that
+  same override, after the guard: the guard runs first and its `forbidden`
+  dict then passes through the conversion like any other refusal, so it is
+  delivered as an MCP error result carrying `error_kind` (`operator_tools_refused`
+  or `audience_unresolved`) and a `remediation` with `retryable=false`,
+  instead of the successful result the 002 override returns on its own.
+
 ### Open questions the plan cannot settle
 
-- Q1. `bank_compact` already returns a top-level free-text `remediation`
-  string (`src/live_mem/tools/bank.py:72,1412-1437`). FR-003 makes
-  `remediation` an object. Whether the string moves into
-  `remediation.reason` (a shape change for that tool's clients) or
-  `bank_compact` keeps the string and gains no object is not decided.
-- Q2. No refusal site in 1.6.1 corresponds to `required_prior_step_missing`.
-  Whether the replay test may construct one (for example a hidden-tool call
-  that names the prior agent step) or the value is documented as having no
-  producer is not decided.
-- Q3. `"status": "conflict"` (`bank.py:1365-1372`; `gc.py:420,679,700,722`)
-  is undocumented in `docs/MCP_TOOLS_SPEC.md:108-121` and outside FR-026's
-  refusal statuses. Whether it stays a successful result that carries
-  `error_kind="operation_in_progress"` and a `remediation` with
-  `retryable=true`, or is added to the refusal statuses, is not decided.
 - Q4. The byte cap for the server instructions is not in any source.
-- Q5. The clarification says "tools return the result object themselves".
-  This plan reads it as "the server returns a `CallToolResult` from the tool
-  call instead of raising `ToolError`", implemented once in
-  `HivemindMCPServer.call_tool`, because per-handler `CallToolResult`
-  returns break the `/api/tool` proxy (Item 1). The specification owner
-  should confirm this reading.
 - Q6. The sentence "A non-empty client_name identity is required to
   consolidate notes" (`bank.py:441-448`) is a token identity defect, not an
   argument error; its `error_kind` (`authentication_missing` in this plan)

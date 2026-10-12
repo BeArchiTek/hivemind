@@ -80,6 +80,30 @@ Constitution principles cited below are from
   object themselves, because the SDK's `ToolError` keeps only a text message. A
   tool name that is not registered receives the SDK's "Unknown tool" result;
   this feature does not change it (FR-026).
+- Q: Does "tools return the result object themselves" mean each handler
+  builds a `CallToolResult`, or one server-level conversion? → A: One
+  server-level conversion. Handlers keep returning dicts;
+  `HivemindMCPServer.call_tool` converts every refusal into a
+  `CallToolResult` with `isError=true`, `structuredContent` and the JSON
+  text. The `/api/tool` path stays unchanged.
+- Q: `bank_compact` already returns a top-level free-text `remediation`
+  string (`src/live_mem/tools/bank.py:72`); does it keep the string or take
+  the `remediation` object? → A: The string moves into
+  `remediation.reason`, so every tool has the same shape. The CLI display
+  that reads the string (`scripts/cli/display.py:707,778`) changes in the
+  same pull request.
+- Q: Is a `conflict` result (`src/live_mem/tools/bank.py:1365-1372`) a
+  refusal? → A: No. `conflict` stays a successful result (not `isError`)
+  that carries `error_kind="operation_in_progress"` and a `remediation`
+  with `retryable=true`; `conflict` is added to the documented statuses in
+  `docs/MCP_TOOLS_SPEC.md`.
+- Q: No refusal site in 1.6.1 produces `required_prior_step_missing`; does
+  the value stay in the closed set? → A: Yes. It stays, documented as
+  having no producer yet, and is excluded from the replay test until a tool
+  produces it.
+- Q: Which values does specification 002 (operator tool guard) add to the
+  closed set? → A: `operator_tools_refused` and `audience_unresolved`, both
+  reserved by this feature and produced only by specification 002.
 
 ## User Scenarios & Testing *(mandatory)*
 

@@ -29,9 +29,17 @@ Expected outcome:
   `structuredContent` that deserialize to equal objects, and a payload that
   validates against
   [contracts/guidance-error-payload.schema.json](contracts/guidance-error-payload.schema.json).
-- Every `error_kind` value except `operator_tool_refused` (reserved) and
-  `unclassified_refusal` appears at least once; `unclassified_refusal` never
-  appears; `required_prior_step_missing` depends on open question Q2.
+- Every `error_kind` value appears at least once, except
+  `operator_tools_refused` and `audience_unresolved` (reserved for
+  specification 002), `required_prior_step_missing` (no producer yet,
+  excluded until a tool produces it) and `unclassified_refusal`, which never
+  appears.
+- A `conflict` result (`bank_compact` while a consolidation lock is held)
+  is delivered with `isError=false`, `status="conflict"`,
+  `error_kind="operation_in_progress"` and `remediation.retryable=true`.
+- A `bank_compact` failure carries `remediation.reason` and no top-level
+  string `remediation`; `uv run python -m scripts.cli` shows the reason
+  through `show_bank_compact_failure` (`scripts/cli/display.py:707,778`).
 - For every payload whose `remediation.next_tool` the token may call, the
   named call with the given arguments succeeds.
 - No payload contains "Internal server error" for a cause other than

@@ -4,9 +4,10 @@
 `message` and adds `error_kind` and `remediation`. On the MCP transport the
 dict travels inside a `CallToolResult` with `isError=true`, both as
 `structuredContent` and as JSON text in `content[0]`. The `/api/tool` proxy
-returns the dict unchanged as an HTTP 200 JSON body. Not decided: whether
-`conflict` results carry the guidance fields (open question Q3) and the
-shape of `bank_compact`'s string `remediation` (Q1).
+returns the dict unchanged as an HTTP 200 JSON body. Handlers keep returning
+dicts; the conversion happens once in `HivemindMCPServer.call_tool`. A
+`conflict` result keeps successful delivery and carries the guidance fields;
+`bank_compact`'s former string `remediation` is `remediation.reason`.
 
 The JSON Schema is in
 [guidance-error-payload.schema.json](guidance-error-payload.schema.json).
@@ -81,14 +82,17 @@ Each example keeps the 1.6.1 `message` of its refusal site; `error_kind` and
   {"missing_arguments": ["category"], "reason": "category must be one of
   observation, decision, todo, insight, question, progress, issue, for
   example 'observation'.", "retryable": true}`.
-- `required_prior_step_missing`: no producer in 1.6.1 (open question Q2).
-  Shape: `remediation = {"required_prior_step": "<tool name>",
+- `required_prior_step_missing`: no producer in 1.6.1; the value stays in
+  the closed set and is excluded from the replay test until a tool produces
+  it. Shape: `remediation = {"required_prior_step": "<tool name>",
   "next_tool": "<tool name>", "reason": "...", "retryable": true}`.
 - `operation_in_progress`, `message` "Consolidation is in progress for 'p'.
   Try again in a few minutes." (`src/live_mem/tools/bank.py:1365-1372`):
   `remediation = {"reason": "Wait for the running consolidation to finish,
   then retry; do not submit a second consolidation.", "retryable": true}`.
-  Delivery of this `conflict` result is open question Q3.
+  The result keeps `status="conflict"` and successful delivery
+  (`isError=false`); `conflict` is added to the documented statuses in
+  `docs/MCP_TOOLS_SPEC.md:108-121`.
 - `write_route_refused`, `message` "Writes to a shared space are not accepted
   on this route" (new server-owned text replacing "Internal server error" for
   `StagedWriteNotImplemented` at `src/live_mem/tools/live.py:118-134`):
@@ -99,7 +103,17 @@ Each example keeps the 1.6.1 `message` of its refusal site; `error_kind` and
   (`src/live_mem/auth/context.py:438`): `remediation = {"reason": "The
   server logged the failure under the request identifier; report it to an
   operator.", "retryable": false}`.
-- `operator_tool_refused`: reserved for specification 002; no example.
+- `operator_tools_refused`, `message` "This tool is reserved for operators.
+  Ask an operator to perform the action through the admin console or the
+  CLI with an operator token." (specification 002,
+  `src/live_mem/tools/exposure.py:975-983` on branch
+  `spec/002-operator-tool-guard`), `status` `forbidden`: `remediation =
+  {"reason": "An operator performs this action through the admin console or
+  the CLI with an operator token.", "retryable": false}`; no `next_tool`.
+  Produced only by specification 002.
+- `audience_unresolved`: reserved for specification 002 (a registered tool
+  with no registry entry; startup validation makes it unreachable in a
+  served registry); same `status` and shape as `operator_tools_refused`.
 - `unclassified_refusal`: never intended; `remediation = {"reason": "This
   refusal has no classification; report it to an operator.", "retryable":
   false}`.
@@ -127,8 +141,12 @@ Rules:
 - Every other result keeps the SDK's conversion of a dict (one text item,
   JSON with two-space indentation, no `structuredContent`,
   `mcp/server/mcpserver/utilities/func_metadata.py:653`).
-- `not_found` and `partial` results are not refusals; they keep successful
-  delivery and may carry a `remediation` object (FR-026).
+- `not_found`, `partial` and `conflict` results are not refusals; they keep
+  successful delivery and may carry a `remediation` object (FR-026);
+  `conflict` always carries `error_kind="operation_in_progress"`.
+- `bank_compact` failures (`src/live_mem/tools/bank.py:44-80`) carry the
+  `remediation` object; the former top-level string is
+  `remediation.reason`.
 - A tool name that is not registered receives the SDK's text-only error
   result; this feature does not change it.
 
