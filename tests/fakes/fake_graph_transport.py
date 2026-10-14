@@ -95,6 +95,38 @@ def _strict_document_delete(arguments: dict) -> dict:
     return {"status": "deleted", "document_id": document_id}
 
 
+def _default_memory_ingest_async(arguments: dict) -> dict:
+    """Default ``memory_ingest_async`` mimicking the REAL GM contract (F2).
+
+    The real tool requires ``source_path`` + ``sha256`` and answers at once
+    with a queued/running job (``job_id``) that the bridge then polls through
+    ``ingest_job_status``. A deterministic ``job-<filename>`` id keeps push
+    assertions readable; the default ``ingest_job_status`` reports it
+    ``succeeded`` on the first poll.
+    """
+
+    missing = [k for k in ("memory_id", "content_base64", "filename", "source_path", "sha256")
+               if not arguments.get(k)]
+    if missing:
+        return {
+            "status": "error",
+            "message": f"memory_ingest_async requires {missing} (GM contract)",
+        }
+    return {
+        "status": "queued",
+        "job_id": f"job-{arguments['filename']}",
+        "source_path": arguments["source_path"],
+        "sha256": arguments["sha256"],
+    }
+
+
+def _default_ingest_job_status(arguments: dict) -> dict:
+    job_id = arguments.get("job_id")
+    if not job_id:
+        return {"status": "error", "message": "job_id is required (GM contract)"}
+    return {"status": "succeeded", "job_id": job_id, "progress_percent": 100}
+
+
 # Default canned responses, keyed by GM tool name. ``status == "ok"`` (or the
 # tool's real success status) so the bridge's reshape branches
 # (connect/push/status) take their happy paths. Values are intentionally
@@ -116,6 +148,8 @@ _DEFAULT_RESPONSES: dict[str, Response] = {
     "document_list": {"status": "ok", "documents": []},
     "document_delete": _strict_document_delete,
     "memory_ingest": {"status": "ok", "ingested": True},
+    "memory_ingest_async": _default_memory_ingest_async,
+    "ingest_job_status": _default_ingest_job_status,
     "memory_search": {"status": "ok", "results": []},
     "memory_query": {"status": "ok", "results": []},
     "ontology_list": {"status": "ok", "ontologies": []},

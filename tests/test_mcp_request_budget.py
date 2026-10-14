@@ -1,8 +1,7 @@
-"""MCP wire-byte budgets, before SDK parsing and without response buffering."""
+"""MCP wire-byte budgets: Content-Length refusal before the SDK, no double buffering."""
 from __future__ import annotations
 
 import json
-import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -75,39 +74,36 @@ async def test_invalid_content_length_fails_before_read(headers):
 
 @pytest.mark.parametrize("headers", [[], [(b"content-length", b"1")], [(b"content-length", b"32")]])
 @pytest.mark.parametrize("path", ["/mcp", "/mcp/", "/mcp/variant"])
-async def test_actual_chunk_count_stops_before_overflow_reaches_sdk(headers, path):
-    async def forbidden(*args):
-        pytest.fail("oversized body reached SDK")
+async def test_body_chunks_stream_to_sdk_without_buffering(headers, path):
+    # F6: the guard no longer buffers or counts the body. The downstream app
+    # (the SDK, which owns the byte count) receives the first chunk before
+    # the client has produced the last one, through the original channel.
+    produced, seen = [], []
 
-    app = MCPRequestLimitMiddleware(forbidden, max_bytes=32)
-    messages, reads = await _run(
-        app, [_chunk(b"x" * 16, True), _chunk(b"x" * 16, True), _chunk(b"x", True)],
-        scope=_scope(path, headers),
-    )
-    assert messages[0]["status"] == 413
-    assert reads == 3  # No draining/reading the remaining attacker stream.
+    async def receive():
+        chunk = _chunk(b"x" * 16, more=len(produced) < 2)
+        produced.append(chunk)
+        return chunk
 
+    async def inner(scope, inner_receive, send):
+        assert inner_receive is receive
+        while True:
+            message = await inner_receive()
+            seen.append((message["body"], len(produced)))
+            if not message["more_body"]:
+                break
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
 
-async def test_single_oversized_chunk_is_rejected_before_copying_or_sdk():
-    app = MCPRequestLimitMiddleware(_reader, max_bytes=32)
-    messages, reads = await _run(app, [_chunk(b"x" * 1024, True)])
-    assert messages[0]["status"] == 413
-    assert reads == 1
+    messages = []
 
+    async def send(message):
+        messages.append(message)
 
-async def test_oversized_transport_chunk_is_not_copied_into_buffer():
-    # Allocate a modest transport-owned chunk before measurement. The guard
-    # must reject it without adding another allocation proportional to it.
-    incoming = _chunk(b"x" * (4 * 1024 * 1024))
-    app = MCPRequestLimitMiddleware(_reader, max_bytes=1024)
-    tracemalloc.start()
-    try:
-        messages, _ = await _run(app, [incoming])
-        _, peak = tracemalloc.get_traced_memory()
-    finally:
-        tracemalloc.stop()
-    assert messages[0]["status"] == 413
-    assert peak < 32 * 1024
+    await MCPRequestLimitMiddleware(inner, max_bytes=32)(_scope(path, headers), receive, send)
+    assert messages[0]["status"] == 200
+    assert seen[0] == (b"x" * 16, 1)  # first chunk delivered before the last existed
+    assert len(seen) == 3
 
 
 @pytest.mark.parametrize("size", [0, 31, 32])
@@ -121,16 +117,6 @@ async def test_accepted_body_is_replayed_byte_for_byte(size):
     assert reads == 3
     assert messages[0]["status"] == 200
     assert messages[1]["body"] == body
-
-
-async def test_disconnect_before_complete_body_never_dispatches():
-    async def forbidden(*args):
-        pytest.fail("incomplete request reached SDK")
-
-    app = MCPRequestLimitMiddleware(forbidden, max_bytes=32)
-    messages, reads = await _run(app, [_chunk(b"x", True), {"type": "http.disconnect"}])
-    assert messages == []
-    assert reads == 2
 
 
 @pytest.mark.parametrize("method", ["POST", "GET"])
@@ -174,36 +160,6 @@ async def test_other_namespaces_and_lifespan_receive_unchanged(scope):
     await MCPRequestLimitMiddleware(inner, max_bytes=32)(scope, receive, None)
 
 
-async def test_tiny_chunks_retain_only_bounded_buffer_not_chunk_metadata():
-    limit = 64 * 1024
-    calls = 0
-
-    async def receive():
-        nonlocal calls
-        calls += 1
-        assert calls <= limit + 1
-        return _chunk(b"x", True)
-
-    async def send(message):
-        if message["type"] == "http.response.start":
-            assert message["status"] == 413
-
-    async def forbidden(*args):
-        pytest.fail("oversized stream reached SDK")
-
-    app = MCPRequestLimitMiddleware(forbidden, max_bytes=limit)
-    tracemalloc.start()
-    try:
-        await app(_scope(), receive, send)
-        _, peak = tracemalloc.get_traced_memory()
-    finally:
-        tracemalloc.stop()
-    assert calls == limit + 1
-    # A chunk list would retain >=512KiB of pointers alone. This is a safe
-    # local fixture, not a total-RSS claim for SDK parsing or concurrency.
-    assert peak < 2 * limit + 32 * 1024
-
-
 def test_real_sdk_accepts_exact_limit_initialize_and_streams_sse():
     from mcp.server.mcpserver import MCPServer
     from starlette.testclient import TestClient
@@ -217,7 +173,12 @@ def test_real_sdk_accepts_exact_limit_initialize_and_streams_sse():
     # JSON trailing whitespace is legal and exercises the complete wire cap.
     body += b" " * (limit - len(body))
     mcp = MCPServer("budget-fixture")
-    app = MCPRequestLimitMiddleware(mcp.streamable_http_app(stateless_http=True), max_bytes=limit)
+    # Same budget on both layers, as the production factory configures it: the
+    # guard refuses from Content-Length, the SDK counts a chunked body (F6).
+    app = MCPRequestLimitMiddleware(
+        mcp.streamable_http_app(stateless_http=True, max_request_body_size=limit),
+        max_bytes=limit,
+    )
     headers = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
     with TestClient(app, base_url="http://localhost:8002") as client:
         response = client.post("/mcp", content=body, headers=headers)
@@ -227,6 +188,7 @@ def test_real_sdk_accepts_exact_limit_initialize_and_streams_sse():
         assert '"id":1' in response.text
         response = client.post("/mcp", content=body + b" ", headers=headers)
         assert response.status_code == 413  # SDK cannot translate this to500.
+        # Chunked, no Content-Length: rejected by the SDK limit, not buffered twice.
         response = client.post("/mcp", content=iter([body, b" "]), headers=headers)
         assert response.status_code == 413
 

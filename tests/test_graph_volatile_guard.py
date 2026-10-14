@@ -7,7 +7,7 @@ This suite drives the REAL :class:`GraphBridgeService.push` through the same
 deterministic seam the P4-4 suite uses (``test_long_engine.py``): a real bridge
 wired with a :class:`FakeGraphTransport` client factory, over an in-memory
 :class:`FakeStorage`. NO network / S3 / Neo4j / Qdrant / LLM / clock — every
-``document_list`` / ``document_delete`` / ``memory_ingest`` response is canned
+``document_list`` / ``document_delete`` / ``memory_ingest_async`` response is canned
 and every call is recorded, so each assertion below is reproducible.
 
 LAYERING (reconciled EPIC-P4, ADR-0010/0012):
@@ -139,7 +139,7 @@ def _doc_list_response(documents: list[dict]) -> dict:
 
 # Tool names used as a vocabulary in assertions.
 DELETE = "document_delete"
-INGEST = "memory_ingest"
+INGEST = "memory_ingest_async"  # F2: push submits async ingest jobs
 
 
 def _deleted_filenames(inst: "FakeGraphTransport") -> list[str]:

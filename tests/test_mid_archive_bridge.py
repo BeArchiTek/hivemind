@@ -507,14 +507,15 @@ async def test_real_push_cannot_erase_archive_prepared_after_its_metadata_read(a
 
     async def batch(calls):
         nonlocal pinned
-        assert calls and calls[0][0] == "memory_ingest"
+        assert calls and calls[0][0] == "memory_ingest_async"  # F2: async submit
         assert await c.engine.prepare_archive_ingest("space-a", preimage_id="capture-1") == {
             "status": "ok", "ontology_mode": "auto"}
         _, _, pinned, err = await c.bridge._archive_context("space-a")
         assert err is None
         if frozen:
             c.remote[pinned["memory_id"]]["ontology"] = "auto_0123456789abcdef"
-        return [{"status": "ok"} for _ in calls]
+        # "skipped": the same key + checksum is already active, no job to poll.
+        return [{"status": "skipped"} for _ in calls]
 
     c.client.call_tool.side_effect = call_tool
     c.client.call_tools_batch = AsyncMock(side_effect=batch)

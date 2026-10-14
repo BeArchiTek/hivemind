@@ -145,7 +145,7 @@ def _set_token(tok: dict):
 
 
 def _ingested_filenames(inst) -> list[str]:
-    return [a["filename"] for a in inst.args_for("memory_ingest")]
+    return [a["filename"] for a in inst.args_for("memory_ingest_async")]
 
 
 # =============================================================================
