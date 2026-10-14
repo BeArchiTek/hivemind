@@ -1720,7 +1720,8 @@ def show_graph_status(result: dict):
 def show_graph_push_result(result: dict):
     """Displays the graph_push result."""
     errs = result.get("errors", 0)
-    border = "green" if errs == 0 else "yellow"
+    pending = result.get("pending", 0)
+    border = "green" if errs == 0 and pending == 0 else "yellow"
     lines = [
         f"[bold]Files pushed    :[/bold] {result.get('pushed', 0)}",
         f"[bold]Deleted (re-ingest):[/bold] {result.get('deleted_before_reingest', 0)}",
@@ -1728,6 +1729,11 @@ def show_graph_push_result(result: dict):
         f"[bold]Errors         :[/bold] {'[red]' + str(errs) + '[/red]' if errs else '0'}",
         f"[bold]Duration   :[/bold] {result.get('duration_seconds', 0)}s",
     ]
+    if pending:
+        # Ingest jobs still running on Graph Memory; the next push re-checks them.
+        lines.append(f"[bold]Still ingesting :[/bold] [yellow]{pending}[/yellow]")
+        for pd in result.get("pending_details", []):
+            lines.append(f"  [yellow]… {pd.get('filename', '?')} (job {pd.get('job_id', '?')})[/yellow]")
     error_details = result.get("error_details", [])
     if error_details:
         lines.append("")

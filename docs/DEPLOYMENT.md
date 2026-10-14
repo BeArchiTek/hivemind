@@ -47,6 +47,21 @@ cause container restarts until storage recovers. Check startup logs and restore
 storage/credential access before retrying. The embedded Graph still validates
 the internal credential on every request; revocation or expiry remains denied.
 
+Both runtimes also set the SDK session limits explicitly instead of taking
+its defaults. `MCP_MAX_SESSIONS` (default 10000) caps the open stateful MCP
+sessions per process; at the cap the SDK answers a new `initialize` with HTTP
+503. `MCP_SESSION_IDLE_TIMEOUT_SECONDS` (default 1800) closes a session that
+has had no request in flight for 30 minutes; its id then answers 404 and the
+client initializes a new session. The core runtime additionally caps the open
+sessions each Hivemind bearer token (API credential) may hold:
+`MCP_MAX_SESSIONS_PER_BEARER_TOKEN` (default 100; 0 disables the cap).
+While a bearer token holds that many open sessions, a further `initialize`
+sent with it gets HTTP 429 with a JSON-RPC error body; other bearer tokens are
+unaffected. A session stops counting when the client ends it with `DELETE /mcp`, when it
+expires idle, or when the server drops it. A client that opens one session per
+call, as the Python CLI and the LONG bridge do, ends each one when the call
+returns.
+
 The 75 MiB admission limit bounds requests, not backup/export replies. Owned
 Python clients retain SDK 1's unbounded SSE event sizing with their existing
 timeouts. HTTPX2 uses the OS certificate trust store by default instead of

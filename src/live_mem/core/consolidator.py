@@ -42,6 +42,7 @@ from .consolidation_schema import NORMAL_RESPONSE_SCHEMA_JSON as _NORMAL_RESPONS
 
 from ..config import get_settings
 from .storage import get_storage, bank_relpath
+from .cancel_shield import run_shielded
 from .reservation_guard import assert_space_not_reserved
 from .live_note_format import split_live_note_front_matter
 from .write_sink import DirectLocalWriteSink, StagedWriteNotImplemented
@@ -7615,13 +7616,20 @@ INSTRUCTION: Merge these versions into ONE coherent version.
                     "failures": [failure],
                 })
             try:
-                rollback_failures = await self._rollback_prepared_compaction_attempts(
-                    attempted, direct_local_sink
+                # Shielded: a cancellation arriving during recovery waits for
+                # the rollback to finish, then propagates (F4). The rollback
+                # has completed whenever ``run_shielded`` returns, so the
+                # cancellation carries its real outcome, not a cancelled one.
+                rollback_failures, deferred_cancel = await run_shielded(
+                    self._rollback_prepared_compaction_attempts(
+                        attempted, direct_local_sink
+                    )
                 )
             except asyncio.CancelledError as cancelled:
-                # An ordinary apply failure may race a task cancellation while
-                # recovery is in progress.  Preserve that fact for the queue
-                # instead of exposing a falsely clean cancelled transaction.
+                # The rollback itself did not complete (it raised or was
+                # cancelled from elsewhere) while the task was being
+                # cancelled. Preserve that fact for the queue instead of
+                # exposing a falsely clean cancelled transaction.
                 annotate_cancelled_recovery(
                     cancelled,
                     (
@@ -7632,6 +7640,9 @@ INSTRUCTION: Merge these versions into ONE coherent version.
                     ),
                 )
                 raise
+            if deferred_cancel is not None:
+                annotate_cancelled_recovery(deferred_cancel, tuple(rollback_failures))
+                raise deferred_cancel
             if rollback_failures:
                 return with_preimage_id({
                     "status": "partial",
@@ -7659,8 +7670,14 @@ INSTRUCTION: Merge these versions into ONE coherent version.
             """
 
             try:
-                rollback_failures = await self._rollback_prepared_compaction_attempts(
-                    attempted, direct_local_sink
+                # The rollback itself is never cancelled: a further
+                # cancellation (anyio re-delivers one at every checkpoint)
+                # waits for it to complete and is then dropped here, because
+                # the caller re-raises the original ``cancelled`` (F4).
+                rollback_failures, _deferred_cancel = await run_shielded(
+                    self._rollback_prepared_compaction_attempts(
+                        attempted, direct_local_sink
+                    )
                 )
             except asyncio.CancelledError as rollback_cancelled:
                 failures = (

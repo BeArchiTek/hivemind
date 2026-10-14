@@ -87,9 +87,12 @@ class MCPClient:
                 # SDK 1 allowed large backup/export responses; only requests are size-bounded.
                 max_sse_event_size=None,
             ) as (read, write):
-                async with ClientSession(
-                    read, write, read_timeout_seconds=self.timeout,
-                ) as session:
+                # No per-request deadline: in SDK 2 `read_timeout_seconds`
+                # is a hard cap after which the client sends
+                # notifications/cancelled and the server aborts long tools
+                # (bank compact --apply, graph push, backup restore). The
+                # HTTPX2 idle read timeout above still bounds a dead stream.
+                async with ClientSession(read, write) as session:
                     # The SDK handles the initialize handshake automatically
                     await session.initialize()
 

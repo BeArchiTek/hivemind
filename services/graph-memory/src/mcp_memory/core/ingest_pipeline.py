@@ -23,6 +23,7 @@ Conception (cf. DESIGN/INGESTION_ASYNCHRONE.md) :
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import sys
 import time as _time
@@ -690,6 +691,47 @@ async def run_ingest_pipeline(
             out["cleanup"] = cleanup
             out["message"] += f" | incomplete rollback: {cleanup['errors']}"
         return out
+    except BaseException:
+        # Annulation de la tâche (asyncio.CancelledError n'est PAS une
+        # Exception) : en SDK 2 le serveur annule le handler quand le client
+        # se déconnecte ou envoie notifications/cancelled. Même rollback que
+        # pour une erreur, protégé de l'annulation, puis on re-lève — jamais
+        # d'objet S3 orphelin ni de Document 'running' laissé derrière.
+        if not is_promoted:
+            await _await_shielded(
+                _rollback(
+                    memory_id,
+                    doc_id,
+                    s3_uploaded_uri,
+                    delete_vectors=vector_write_attempted,
+                )
+            )
+        raise
+
+
+async def _await_shielded(coro):
+    """Attend ``coro`` jusqu'au bout ; une annulation reçue pendant l'attente
+    est différée puis re-levée une fois la tâche terminée (jamais annulée)."""
+    task = asyncio.ensure_future(coro)
+    pending_cancel = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as cancelled:
+            if task.cancelled():
+                raise
+            if pending_cancel is None:
+                pending_cancel = cancelled
+        except BaseException:
+            # ``asyncio.shield`` relaie l'exception de la tâche protégée ; elle
+            # est relue ci-dessous pour qu'une annulation en attente prime.
+            if not task.done():  # pragma: no cover
+                raise
+    if pending_cancel is not None:
+        if not task.cancelled() and task.exception() is not None:
+            raise pending_cancel from task.exception()
+        raise pending_cancel
+    return task.result()
 
 
 async def _rollback(

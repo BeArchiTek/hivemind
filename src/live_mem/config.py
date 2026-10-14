@@ -13,6 +13,7 @@ Usage :
 """
 
 import logging
+import math
 import re
 from functools import lru_cache
 
@@ -285,6 +286,16 @@ class Settings(BaseSettings):
     # Keep the same default in the Caddyfile and both Compose services.
     mcp_request_max_bytes: int = 75 * 1024 * 1024
 
+    # ─── MCP sessions (SDK 2 limits, explicit) ────────────────
+    # Open stateful Streamable HTTP sessions per process; the SDK answers 503
+    # to a new initialize at the cap. Idle sessions (no request in flight)
+    # are closed after the timeout and their id then answers 404.
+    mcp_max_sessions: int = 10000
+    mcp_session_idle_timeout_seconds: float = 1800.0
+    # Open sessions one token may hold; a further initialize gets HTTP 429.
+    # 0 disables the per-bearer-token cap (the process cap still applies).
+    mcp_max_sessions_per_bearer_token: int = 100
+
     # ─── Admin console /api/tool (ADM-05 fix) ─────────────
     api_tool_max_body_bytes: int = 1_048_576  # Max request body for /api/tool (1 MB)
 
@@ -302,6 +313,21 @@ class Settings(BaseSettings):
 
         if self.mcp_request_max_bytes < 1:
             errors.append("MCP_REQUEST_MAX_BYTES must be a positive byte count")
+        if self.mcp_max_sessions < 1:
+            errors.append("MCP_MAX_SESSIONS must be a positive session count")
+        if not (
+            math.isfinite(self.mcp_session_idle_timeout_seconds)
+            and self.mcp_session_idle_timeout_seconds > 0
+        ):
+            errors.append(
+                "MCP_SESSION_IDLE_TIMEOUT_SECONDS must be a positive, finite "
+                "number of seconds"
+            )
+        if self.mcp_max_sessions_per_bearer_token < 0:
+            errors.append(
+                "MCP_MAX_SESSIONS_PER_BEARER_TOKEN must be 0 (disabled) or a positive "
+                "session count"
+            )
 
         # Port range
         if not (1 <= self.mcp_server_port <= 65535):
