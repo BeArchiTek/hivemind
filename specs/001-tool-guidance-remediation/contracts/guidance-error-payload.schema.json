@@ -1,0 +1,240 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hivemind/specs/001/guidance-error-payload",
+  "title": "Guidance error payload",
+  "description": "The dict a refused Hivemind tool call returns. status and message keep their 1.6.1 values; every other field is additive (spec.md FR-001, FR-003, FR-027). Existing per-tool fields such as reason, failure_reason, recovery_required and rejected_volatile are allowed and unchanged.",
+  "type": "object",
+  "required": [
+    "status",
+    "message",
+    "error_kind",
+    "remediation"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "error",
+        "forbidden",
+        "conflict"
+      ],
+      "description": "error or forbidden for a refusal; conflict for the successful result that carries error_kind operation_in_progress."
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1
+    },
+    "error_kind": {
+      "type": "string",
+      "enum": [
+        "authentication_missing",
+        "token_scope_changed",
+        "invalid_space_id",
+        "space_access_denied",
+        "permission_insufficient",
+        "missing_argument",
+        "invalid_argument",
+        "required_prior_step_missing",
+        "operation_in_progress",
+        "write_route_refused",
+        "internal_failure",
+        "operator_tools_refused",
+        "audience_unresolved",
+        "unclassified_refusal"
+      ]
+    },
+    "remediation": {
+      "type": "object",
+      "required": [
+        "reason",
+        "retryable"
+      ],
+      "properties": {
+        "next_tool": {
+          "type": "string",
+          "description": "A registered tool name the token may call."
+        },
+        "arguments": {
+          "type": "object",
+          "description": "Arguments for next_tool or for the retried call; server-owned values only."
+        },
+        "missing_arguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "required_prior_step": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "required_permission": {
+      "type": "string",
+      "enum": [
+        "read",
+        "write",
+        "manage",
+        "admin"
+      ]
+    },
+    "current_permissions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "read",
+          "write",
+          "manage",
+          "admin"
+        ]
+      }
+    },
+    "accessible_spaces": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "existing_job": {
+      "type": "object",
+      "description": "Present only on the consolidation acknowledgement (FR-007), which is not a refusal."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "error_kind": {
+            "const": "permission_insufficient"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "required_permission",
+          "current_permissions"
+        ],
+        "properties": {
+          "remediation": {
+            "not": {
+              "required": [
+                "next_tool"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "error_kind": {
+            "const": "space_access_denied"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "accessible_spaces"
+        ],
+        "properties": {
+          "remediation": {
+            "properties": {
+              "next_tool": {
+                "const": "space_list"
+              }
+            },
+            "required": [
+              "next_tool"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "error_kind": {
+            "enum": [
+              "missing_argument",
+              "invalid_argument"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "remediation": {
+            "required": [
+              "missing_arguments"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "conflict"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "error_kind": {
+            "const": "operation_in_progress"
+          },
+          "remediation": {
+            "properties": {
+              "retryable": {
+                "const": true
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "error_kind": {
+            "enum": [
+              "operator_tools_refused",
+              "audience_unresolved"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "const": "forbidden"
+          },
+          "remediation": {
+            "properties": {
+              "retryable": {
+                "const": false
+              }
+            },
+            "not": {
+              "required": [
+                "next_tool"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}
