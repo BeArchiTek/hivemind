@@ -349,13 +349,13 @@ async def test_equal_count_key_substitution_is_rejected_without_delete(
         expected_eligible_set_token=dry["eligible_set_token"],
     )
 
-    assert result == {
+    assert {k: result[k] for k in ("status", "reason", "action", "deleted")} == {
         "status": "conflict",
         "reason": "eligible_set_changed",
         "action": "delete",
         "deleted": 0,
-        "message": result["message"],
     }
+    assert result["message"]
     assert "eligible_set_token" not in result
     assert storage.snapshot() == before_delete
     assert key_b in storage.objects

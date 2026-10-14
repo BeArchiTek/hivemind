@@ -53,15 +53,28 @@ def reserved_space_error(space_id: str) -> dict | None:
     when the caller is an administrator or requests unsafe recovery.
     """
     if _DERIVED_NAMESPACE.fullmatch(space_id) or _MID_ARCHIVE_NAMESPACE.fullmatch(space_id):
-        return {
-            "status": "error",
-            "recovery_required": True,
-            "message": (
+        # Specification 001: the remediation gives the allowed format only and
+        # does not say whether a space exists under the reserved identifier.
+        from ..tools.guidance import ErrorKind, refusal, remediation
+
+        return refusal(
+            (
                 "This identifier is reserved for derived Graph memory. "
                 "Existing Hivemind data under it requires separately authorized "
                 "operator recovery; no automatic read, migration or deletion."
             ),
-        }
+            ErrorKind.INVALID_SPACE_ID,
+            recovery_required=True,
+            remediation=remediation(
+                reason=(
+                    "Use a space identifier outside the reserved namespaces: "
+                    "letters, digits, hyphens and underscores, at most 64 "
+                    "characters, for example 'project-alpha'."
+                ),
+                retryable=True,
+                missing_arguments=["space_id"],
+            ),
+        )
     return None
 
 

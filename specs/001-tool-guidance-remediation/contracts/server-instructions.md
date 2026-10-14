@@ -20,8 +20,11 @@ source that states it.
 2. Write discipline: write atomic `short_note` entries in one of
    `observation`, `decision`, `todo`, `insight`, `question`, `progress`,
    `issue`; the agent identity comes from the token and is never passed;
-   never write the bank directly; never put tokens, endpoints or secrets in
-   notes (`docs/AGENT_MEMORY_SETUP.md:123-130,154-156`;
+   every human decision and every blocking question raised to the human is
+   written as a `short_note` (`decision` or `question`) in the same turn,
+   before it is relayed, published or acted on; never write the bank
+   directly; never put tokens, endpoints or secrets in
+   notes (`docs/AGENT_MEMORY_SETUP.md:123-136,160-162`;
    `RULES/live-mem.standard.memory.bank.md:126-134`).
 3. End of a work block: write one summary note, confirm user validation,
    call `mid_consolidate` at most once, return without polling;

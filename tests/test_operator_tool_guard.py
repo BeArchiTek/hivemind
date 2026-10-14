@@ -98,6 +98,20 @@ FIXTURE_TOKENS = {
     },
 }
 
+def _assert_operator_refusal(payload: dict, cause: str = "operator_tools_refused") -> None:
+    """The guard's refusal, as specification 001 delivers it.
+
+    ``status`` and ``message`` are the spec 002 values; the guard also carries
+    its reserved ``error_kind`` and a remediation with no corrective call.
+    """
+    assert payload["status"] == "forbidden", payload
+    assert payload["message"] == REFUSAL_MESSAGE, payload
+    assert payload["error_kind"] == cause, payload
+    assert payload["remediation"]["retryable"] is False, payload
+    assert "next_tool" not in payload["remediation"], payload
+    assert set(payload) == {"status", "message", "error_kind", "remediation"}, payload
+
+
 OPERATOR_ENTRIES = tuple(
     entry for entry in TOOL_EXPOSURES if entry.audience is ToolAudience.OPERATOR
 )
@@ -225,6 +239,15 @@ def _call(client, headers: dict, name: str, arguments: dict) -> dict:
     result = message["result"]
     text = result["content"][0]["text"]
     if result.get("isError"):
+        # Specification 001 delivers a refusal as an MCP error result whose
+        # text is the payload; the SDK's "Unknown tool" text stays plain.
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and "status" in payload:
+            assert result.get("structuredContent") == payload
+            return payload
         return {"isError": True, "text": text}
     return json.loads(text)
 
@@ -277,7 +300,12 @@ def test_agent_token_is_refused_for_mid_write_and_its_alias_over_mcp(monkeypatch
         canonical = _call(client, headers, "mid_write", arguments)
         alias = _call(client, headers, "bank_write", arguments)
 
-    assert canonical == {"status": "forbidden", "message": REFUSAL_MESSAGE}
+    _assert_operator_refusal(canonical)
+    # The alias refusal differs only by its reason naming the canonical tool.
+    assert alias["remediation"]["reason"] == (
+        canonical["remediation"]["reason"] + " Canonical tool: mid_write."
+    )
+    alias["remediation"]["reason"] = canonical["remediation"]["reason"]
     assert alias == canonical
     storage.exists.assert_not_awaited()
 
@@ -305,10 +333,8 @@ def test_every_operator_entry_and_alias_is_refused_for_an_agent_token(monkeypatc
 
     # 36 operator entries plus their 4 historical aliases.
     assert len(OPERATOR_ENTRIES) == 36 and len(OPERATOR_NAMES) == 40
-    assert all(
-        payload == {"status": "forbidden", "message": REFUSAL_MESSAGE}
-        for payload in refused.values()
-    ), {name: payload for name, payload in refused.items() if payload.get("status") != "forbidden"}
+    for name, payload in refused.items():
+        _assert_operator_refusal(payload)
     # Agent-core tools are untouched by the guard.
     assert whoami["status"] == "ok" and whoami["client_name"] == "agent-worker"
     assert len(_refusal_records(audit)) == len(OPERATOR_NAMES)
@@ -333,7 +359,7 @@ async def test_non_boolean_attribute_and_unresolved_audience_fail_closed(
 ):
     corrupt = {**_identity("manage"), "operator_tools": "yes"}
     refused = await _low_level_call(exposed_mcp, "space_export", {"space_id": "proj"}, corrupt)
-    assert refused == {"status": "forbidden", "message": REFUSAL_MESSAGE}
+    _assert_operator_refusal(refused)
 
     # A registered name without a registry entry cannot happen after startup
     # validation; if it does, the audience is unknown and the call is refused.
@@ -344,7 +370,7 @@ async def test_non_boolean_attribute_and_unresolved_audience_fail_closed(
 
     allowed_identity = {**_identity("manage"), "operator_tools": True}
     refused_rogue = await _low_level_call(exposed_mcp, "rogue_operator_tool", {}, allowed_identity)
-    assert refused_rogue == {"status": "forbidden", "message": REFUSAL_MESSAGE}
+    _assert_operator_refusal(refused_rogue, cause="audience_unresolved")
 
     causes = [(entry["tool"], entry["cause"], entry["canonical_tool"]) for entry in _refusal_records(audit)]
     assert causes == [
@@ -361,7 +387,8 @@ async def test_missing_identity_is_refused_by_the_handler_not_the_guard(
     authentication gate refuses (constitution principle II), and the guard
     writes no operator_tool_refused entry for it."""
     refused = await _low_level_call(exposed_mcp, "space_export", {"space_id": "proj"}, None)
-    assert refused == {"status": "error", "message": "Authentication required"}
+    assert (refused["status"], refused["message"]) == ("error", "Authentication required")
+    assert refused["error_kind"] != "operator_tools_refused"
     assert _refusal_records(audit) == []
 
 
@@ -395,7 +422,7 @@ def test_attribute_change_applies_on_the_next_call_of_an_open_session(monkeypatc
         after = _call(client, headers, "mid_write", arguments)
 
     assert before == {"status": "not_found", "message": "Space 'proj' not found"}
-    assert after == {"status": "forbidden", "message": REFUSAL_MESSAGE}
+    _assert_operator_refusal(after)
     assert storage.exists.await_count == 1
 
 
@@ -414,7 +441,7 @@ async def test_cli_client_operator_commands_work_with_an_operator_token(monkeypa
     assert operator_write == {"status": "not_found", "message": "Space 'proj' not found"}
     assert admin_list == {"status": "ok", "tokens": [], "total": 0}
     tokens.list_tokens.assert_awaited_once()
-    assert agent_write == {"status": "forbidden", "message": REFUSAL_MESSAGE}
+    _assert_operator_refusal(agent_write)
     assert [entry["client"] for entry in _refusal_records(audit)] == ["agent-worker"]
 
 
@@ -433,7 +460,7 @@ def test_api_tool_route_keeps_operators_and_refuses_agent_tokens(monkeypatch, au
     assert operator.json() == {"status": "not_found", "message": "Space 'proj' not found"}
     assert legacy.json() == operator.json()
     assert agent.status_code == 200
-    assert agent.json() == {"status": "forbidden", "message": REFUSAL_MESSAGE}
+    _assert_operator_refusal(agent.json())
     assert unknown.json() == {"status": "error", "message": "Unknown tool: no_such_tool"}
     assert storage.exists.await_count == 2
     entries = _refusal_records(audit)
@@ -468,7 +495,7 @@ async def test_call_tool_direct_reads_the_console_identity(monkeypatch, audit):
     finally:
         auth_context.current_token_info.reset(ambient)
 
-    assert refused == {"status": "forbidden", "message": REFUSAL_MESSAGE}
+    _assert_operator_refusal(refused)
     assert allowed == {"status": "not_found", "message": "Space 'proj' not found"}
     assert [entry["route"] for entry in _refusal_records(audit)] == ["api_tool"]
 

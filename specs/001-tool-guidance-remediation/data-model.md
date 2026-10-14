@@ -136,6 +136,10 @@ Grounded in the refusal sites listed in [research.md](research.md), Item 4.
   not allowed operator tools); not produced by this feature.
 - `audience_unresolved`: reserved for specification 002 (a registered tool
   with no registry entry); not produced by this feature.
+- `maintenance_in_progress`: the selective maintenance barrier refused the
+  call (`src/live_mem/tools/maintenance_gate.py`), or a paused Graph Memory
+  returned the same refusal through a graph tool; `remediation.retryable`
+  is true.
 - `unclassified_refusal`: assigned by the conversion point to a refusal
   without `error_kind`; a defect indicator, never a designed outcome.
 

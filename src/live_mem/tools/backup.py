@@ -19,6 +19,8 @@ import re
 from typing import Annotated
 
 from mcp.server.mcpserver import MCPServer
+
+from ..auth.context import authentication_required
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
@@ -46,11 +48,22 @@ def _parse_backup_id(backup_id: str) -> tuple[str | None, str | None, dict | Non
     pour empêcher path traversal (ex: ``"../_system/foo"``) ou injection
     de préfixes système.
     """
+    from .guidance import ErrorKind, argument_refusal
+
+    format_reason = (
+        "backup_id has the format space_id/timestamp, for example "
+        "'project-alpha/2026-03-08T10-00-00'; backup_list shows the identifiers."
+    )
     if not backup_id or not isinstance(backup_id, str):
         return (
             None,
             None,
-            {"status": "error", "message": "backup_id is required"},
+            argument_refusal(
+                "backup_id is required",
+                kind=ErrorKind.MISSING_ARGUMENT,
+                arguments=["backup_id"],
+                reason=format_reason,
+            ),
         )
 
     parts = backup_id.split("/", 1)
@@ -58,10 +71,12 @@ def _parse_backup_id(backup_id: str) -> tuple[str | None, str | None, dict | Non
         return (
             None,
             None,
-            {
-                "status": "error",
-                "message": "Invalid backup_id (expected format: space_id/timestamp)",
-            },
+            argument_refusal(
+                "Invalid backup_id (expected format: space_id/timestamp)",
+                kind=ErrorKind.INVALID_ARGUMENT,
+                arguments=["backup_id"],
+                reason=format_reason,
+            ),
         )
 
     sid, ts = parts
@@ -69,22 +84,32 @@ def _parse_backup_id(backup_id: str) -> tuple[str | None, str | None, dict | Non
         return (
             None,
             None,
-            {
-                "status": "error",
-                "message": f"Invalid space_id in backup_id: '{sid[:64]}'",
-            },
+            argument_refusal(
+                f"Invalid space_id in backup_id: '{sid[:64]}'",
+                kind=ErrorKind.INVALID_ARGUMENT,
+                arguments=["backup_id"],
+                reason=(
+                    "The space_id part of backup_id contains only letters, digits, "
+                    "hyphens and underscores, for example 'project-alpha'."
+                ),
+            ),
         )
     if not _TIMESTAMP_RE.match(ts):
         return (
             None,
             None,
-            {
-                "status": "error",
-                "message": (
+            argument_refusal(
+                (
                     f"Invalid timestamp in backup_id: '{ts[:32]}' "
                     "(expected: YYYY-MM-DDTHH-MM-SS or a suffixed operation id)"
                 ),
-            },
+                kind=ErrorKind.INVALID_ARGUMENT,
+                arguments=["backup_id"],
+                reason=(
+                    "The timestamp part of backup_id has the format "
+                    "YYYY-MM-DDTHH-MM-SS, for example '2026-03-08T10-00-00'."
+                ),
+            ),
         )
 
     return sid, ts, None
@@ -102,40 +127,24 @@ def register(mcp: MCPServer) -> int:
     """
 
     @mcp.tool(
-        description="Create an S3 backup of one space or all spaces.",
         annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=False),
     )
     async def backup_create(
         space_id: Annotated[
             str,
             Field(
-                description="Space to back up (empty means all spaces and requires admin)"
+                description="Space to back up, for example 'project-alpha'; empty backs up every space and requires permission admin"
             ),
         ],
         description: Annotated[
             str,
             Field(
                 default="",
-                description="Optional backup description (for example, 'before migration')",
+                description="Backup description, for example 'before migration'. Default: empty",
             ),
         ] = "",
     ) -> dict:
-        """
-        Crée un snapshot complet d'un espace sur S3.
-
-        Copie tous les fichiers (meta, rules, notes, bank, synthesis)
-        dans _backups/{space_id}/{timestamp}/.
-
-        Si space_id est vide, crée un backup de TOUS les espaces
-        (permission admin requise). Les erreurs sur un espace
-        n'empêchent pas le backup des suivants.
-
-        Args:
-            space_id: Espace à sauvegarder (vide = tous, admin requis)
-            description: Description du backup (optionnel)
-
-        Returns:
-            backup_id, nombre de fichiers, taille totale
+        """Operator tool: not advertised in tools/list. Create a backup of one space, or of every space when space_id is empty (permission admin). Requires permission write and access to space_id.
         """
         from ..auth.context import (
             check_access,
@@ -168,7 +177,6 @@ def register(mcp: MCPServer) -> int:
             return safe_error(e, "backup")
 
     @mcp.tool(
-        description="List backups visible to the caller.",
         annotations=ToolAnnotations(readOnlyHint=True),
     )
     async def backup_list(
@@ -176,21 +184,11 @@ def register(mcp: MCPServer) -> int:
             str,
             Field(
                 default="",
-                description="Filter by space (empty = all accessible spaces)",
+                description="Space filter, for example 'project-alpha'. Default: empty, every accessible space",
             ),
         ] = "",
     ) -> dict:
-        """
-        Liste les backups disponibles.
-
-        Si space_id est fourni, ne liste que les backups de cet espace.
-        Sinon, liste tous les backups de tous les espaces accessibles.
-
-        Args:
-            space_id: Filtrer par espace (vide = tous)
-
-        Returns:
-            Liste des backups avec backup_id et timestamp
+        """Operator tool: not advertised in tools/list. List the backups the token can view, for one space or for every accessible space. Requires permission read.
         """
         # HM-04 fix : lire le store FRAIS (_get_effective_token_info) et non le
         # contextvar figé. Dans une session MCP Streamable-HTTP, current_token_info
@@ -204,7 +202,7 @@ def register(mcp: MCPServer) -> int:
         try:
             token_info = _get_effective_token_info()
             if token_info is None:
-                return {"status": "error", "message": "Authentication required"}
+                return authentication_required()
 
             # Si un espace est spécifié, vérifier l'accès
             if space_id:
@@ -244,13 +242,13 @@ def register(mcp: MCPServer) -> int:
     async def backup_restore(
         backup_id: Annotated[
             str,
-            Field(description="Backup identifier in 'space_id/timestamp' format"),
+            Field(description="Backup identifier in the format space_id/timestamp, for example 'project-alpha/2026-03-08T10-00-00'"),
         ],
         confirm: Annotated[
             bool,
             Field(
                 default=False,
-                description="Must be true to confirm the restore operation",
+                description='true confirms the restore; false refuses it. Default: false',
             ),
         ] = False,
         unsafe_recovery: Annotated[
@@ -258,38 +256,12 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default=False,
                 description=(
-                    "Explicitly allow a forward-only restore over an existing "
-                    "shared space in an unsafe recovery state. The operation "
-                    "records an audit event, requires peer resynchronization, "
-                    "and never bypasses corruption checks."
+                    'true allows a forward-only restore over an existing shared space in an unsafe recovery state (records an audit event, requires peer resynchronization, never bypasses corruption checks); false refuses it. Default: false'
                 ),
             ),
         ] = False,
     ) -> dict:
-        """
-        Restore a space from a backup.
-
-        By default, the target space must not already exist. An explicit
-        ``confirm=True`` acknowledgement is always required.
-
-        Restoring over an existing shared or unsafe Hivemind space is refused
-        unless ``unsafe_recovery=True`` is supplied explicitly. Corrupted state
-        always fails closed, regardless of that flag.
-
-        Unsafe recovery advances coordination state rather than rolling it
-        backward, preserves deletion knowledge, clears incompatible queued
-        work, records the recovery, and places the node in a state that requires
-        peer resynchronization. If the safety preconditions cannot be proven,
-        the restore is refused without mutation.
-
-        Args:
-            backup_id: Identifier in ``space_id/timestamp`` format.
-            confirm: Must be true to acknowledge the destructive restore.
-            unsafe_recovery: Explicitly authorize forward-only recovery over an
-                existing shared space in an unsafe state.
-
-        Returns:
-            Restored file count and recovery status.
+        """Operator tool: not advertised in tools/list. Restore a space from a backup; confirm=true is required, the target space must not exist unless unsafe_recovery=true, and corrupt state always fails closed. Requires permission manage and access to the backup's space.
         """
         from ..auth.context import check_access, check_manage_permission
         from ..core.backup import get_backup_service
@@ -312,10 +284,12 @@ def register(mcp: MCPServer) -> int:
                 return manage_err
 
             if not confirm:
-                return {
-                    "status": "error",
-                    "message": "Restore refused: confirm=True is required.",
-                }
+                from .guidance import confirm_required
+
+                return confirm_required(
+                    "Restore refused: confirm=True is required.",
+                    "restore the backup over the space",
+                )
 
             return await get_backup_service().restore(
                 backup_id, unsafe_recovery=unsafe_recovery
@@ -326,23 +300,15 @@ def register(mcp: MCPServer) -> int:
             return safe_error(e, "backup")
 
     @mcp.tool(
-        description="Download a backup as a base64-encoded tar archive.",
         annotations=ToolAnnotations(readOnlyHint=True),
     )
     async def backup_download(
         backup_id: Annotated[
             str,
-            Field(description="Backup identifier in 'space_id/timestamp' format"),
+            Field(description="Backup identifier in the format space_id/timestamp, for example 'project-alpha/2026-03-08T10-00-00'"),
         ],
     ) -> dict:
-        """
-        Télécharge un backup en archive tar.gz (base64).
-
-        Args:
-            backup_id: Format "space_id/timestamp"
-
-        Returns:
-            Archive base64, taille, nombre de fichiers
+        """Operator tool: not advertised in tools/list. Download a backup as a base64-encoded tar archive. Requires permission read and access to the backup's space.
         """
         # HM-04 fix : cohérence — store frais plutôt que contextvar figé.
         from ..auth.context import _get_effective_token_info, check_access
@@ -351,7 +317,7 @@ def register(mcp: MCPServer) -> int:
         try:
             token_info = _get_effective_token_info()
             if token_info is None:
-                return {"status": "error", "message": "Authentication required"}
+                return authentication_required()
 
             # LM2-09 fix : valider strictement le backup_id avant accès S3
             space_id, _ts, parse_err = _parse_backup_id(backup_id)
@@ -369,31 +335,22 @@ def register(mcp: MCPServer) -> int:
             return safe_error(e, "backup")
 
     @mcp.tool(
-        description="Permanently delete a backup.",
         annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True),
     )
     async def backup_delete(
         backup_id: Annotated[
             str,
-            Field(description="Backup identifier in 'space_id/timestamp' format"),
+            Field(description="Backup identifier in the format space_id/timestamp, for example 'project-alpha/2026-03-08T10-00-00'"),
         ],
         confirm: Annotated[
             bool,
             Field(
                 default=False,
-                description="Must be true to confirm permanent deletion",
+                description='true confirms the permanent deletion; false refuses it. Default: false',
             ),
         ] = False,
     ) -> dict:
-        """
-        Supprime un backup (irréversible).
-
-        Args:
-            backup_id: Format "space_id/timestamp"
-            confirm: Doit être True pour confirmer (sécurité)
-
-        Returns:
-            Nombre de fichiers supprimés
+        """Operator tool: not advertised in tools/list. Permanently delete a backup; confirm=true is required. Requires permission manage and access to the backup's space.
         """
         from ..auth.context import check_access, check_manage_permission
         from ..core.backup import get_backup_service
@@ -415,10 +372,12 @@ def register(mcp: MCPServer) -> int:
                 return manage_err
 
             if not confirm:
-                return {
-                    "status": "error",
-                    "message": "Deletion refused: confirm=True is required.",
-                }
+                from .guidance import confirm_required
+
+                return confirm_required(
+                    "Deletion refused: confirm=True is required.",
+                    "delete the backup",
+                )
 
             return await get_backup_service().delete(backup_id)
         except Exception as e:

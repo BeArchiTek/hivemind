@@ -114,6 +114,14 @@ Each example keeps the 1.6.1 `message` of its refusal site; `error_kind` and
 - `audience_unresolved`: reserved for specification 002 (a registered tool
   with no registry entry; startup validation makes it unreachable in a
   served registry); same `status` and shape as `operator_tools_refused`.
+- `maintenance_in_progress`, `message` "Maintenance in progress; retry later"
+  (`src/live_mem/tools/maintenance_gate.py`, the selective maintenance
+  barrier; the same payload returned by a paused Graph Memory through a
+  graph tool is classified at the conversion point): `remediation =
+  {"reason": "An operator paused this deployment for maintenance (POST
+  /api/maintenance); retry after the operator resumes it.", "retryable":
+  true}`; the top-level `error` field keeps the fixed code
+  `maintenance_admission_closed`.
 - `unclassified_refusal`: never intended; `remediation = {"reason": "This
   refusal has no classification; report it to an operator.", "retryable":
   false}`.

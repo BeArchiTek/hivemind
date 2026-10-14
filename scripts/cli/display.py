@@ -704,7 +704,14 @@ def show_bank_compact_failure(result: dict):
     recovery_required = result.get("recovery_required") is True
     failure_reason = escape_markup(str(result.get("failure_reason", "unknown")))
     message = escape_markup(str(result.get("message", "")))
-    remediation = escape_markup(str(result.get("remediation", "<missing>")))
+    # The remediation is an object whose reason is the sentence to show
+    # (specification 001); an absent object shows <missing>.
+    remediation_value = result.get("remediation")
+    if isinstance(remediation_value, dict):
+        remediation_text = remediation_value.get("reason", "<missing>")
+    else:
+        remediation_text = "<missing>"
+    remediation = escape_markup(str(remediation_text))
     preimage_id = result.get("preimage_id")
     failures = result.get("failures")
     if not isinstance(failures, list):

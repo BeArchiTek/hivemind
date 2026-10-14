@@ -68,6 +68,32 @@ class RequestIdMiddleware:
 
 
 # =============================================================================
+# Tool outcome record (specification 001, FR-030)
+# =============================================================================
+
+
+def _tool_outcome_from_scope(scope) -> dict | None:
+    """Read the refusal record a tool call wrote into the ASGI request state.
+
+    Returns ``{"tool": ..., "error_kind": ...}`` or ``None``. Both values are
+    strings from closed sets; nothing else is copied.
+    """
+    from .tools.guidance import TOOL_OUTCOME_STATE_KEY
+
+    state = scope.get("state")
+    if not isinstance(state, dict):
+        return None
+    outcome = state.get(TOOL_OUTCOME_STATE_KEY)
+    if not isinstance(outcome, dict):
+        return None
+    tool = outcome.get("tool")
+    kind = outcome.get("error_kind")
+    if not isinstance(tool, str) or not isinstance(kind, str):
+        return None
+    return {"tool": tool, "error_kind": kind}
+
+
+# =============================================================================
 # MetricsMiddleware
 # =============================================================================
 
@@ -90,6 +116,10 @@ class MetricsMiddleware:
         self._latency_ms: dict[str, float] = defaultdict(float)
         # Status code distribution
         self._status_codes: dict[int, int] = defaultdict(int)
+        # Refused tool calls by (canonical tool, error_kind); both label sets
+        # are closed (registry names plus ``unknown``; the error_kind set), so
+        # the cardinality is bounded (specification 001, FR-030).
+        self._refusal_count: dict[tuple[str, str], int] = defaultdict(int)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -131,6 +161,9 @@ class MetricsMiddleware:
             self._status_codes[status_code] += 1
             if status_code >= 400:
                 self._error_count[bucket] += 1
+            outcome = _tool_outcome_from_scope(scope)
+            if outcome is not None:
+                self._refusal_count[(outcome["tool"], outcome["error_kind"])] += 1
 
     # HM-02 : ensemble FIXE de paths connus conservés tels quels comme labels.
     # Tout le reste est templatisé ou collapsé, pour borner la cardinalité.
@@ -191,6 +224,10 @@ class MetricsMiddleware:
                     for path in sorted(self._request_count)
                 },
                 "status_codes": dict(sorted(self._status_codes.items())),
+                "tool_refusals": {
+                    f"{tool}/{kind}": count
+                    for (tool, kind), count in sorted(self._refusal_count.items())
+                },
             }
             body = json.dumps(data).encode()
             ct = b"application/json"
@@ -230,6 +267,19 @@ class MetricsMiddleware:
             for code in sorted(self._status_codes):
                 lines.append(
                     f'livemem_http_status_total{{code="{code}"}} {self._status_codes[code]}'
+                )
+            lines.append("")
+            lines.append(
+                "# HELP livemem_tool_refusals_total Refused tool calls by canonical "
+                "tool and error kind"
+            )
+            lines.append("# TYPE livemem_tool_refusals_total counter")
+            for (tool, kind), count in sorted(self._refusal_count.items()):
+                safe_tool = tool.replace('"', '\\"')
+                safe_kind = kind.replace('"', '\\"')
+                lines.append(
+                    "livemem_tool_refusals_total"
+                    f'{{tool="{safe_tool}",error_kind="{safe_kind}"}} {count}'
                 )
             lines.append("")
             body = "\n".join(lines).encode()
@@ -615,5 +665,12 @@ class AuditMiddleware:
             from .auth.middleware import _client_ip_from_scope
 
             entry["client_ip"] = _client_ip_from_scope(scope)
+
+            # Refused tool call: canonical tool name and error_kind only, never
+            # an argument value or remediation text (specification 001).
+            outcome = _tool_outcome_from_scope(scope)
+            if outcome is not None:
+                entry["tool"] = outcome["tool"]
+                entry["error_kind"] = outcome["error_kind"]
 
             audit_logger.info(json.dumps(entry, ensure_ascii=False))
