@@ -66,6 +66,39 @@ _TARGET_NOT_INVITABLE = {
     "message": "Target token cannot be invited",
 }
 
+# ``admin_update_token`` / ``admin_bulk_update_tokens`` take the operator tool
+# attribute as text, like ``permissions`` and ``email``: empty leaves it
+# unchanged. Anything other than these spellings is refused before the store
+# is read.
+_OPERATOR_TOOLS_TEXT = {"true": True, "false": False}
+
+
+def _parse_operator_tools(value: object) -> tuple[Optional[bool], dict | None]:
+    """Return ``(parsed, error)`` for the text form of ``operator_tools``.
+
+    ``None`` means "no change". The error dict follows the tool result
+    convention and names the accepted spellings.
+    """
+    if value is None:
+        return None, None
+    if isinstance(value, bool):
+        return value, None
+    if not isinstance(value, str):
+        return None, {
+            "status": "error",
+            "message": "Invalid operator_tools: expected 'true' or 'false'",
+        }
+    text = value.strip().lower()
+    if not text:
+        return None, None
+    parsed = _OPERATOR_TOOLS_TEXT.get(text)
+    if parsed is None:
+        return None, {
+            "status": "error",
+            "message": "Invalid operator_tools: expected 'true' or 'false'",
+        }
+    return parsed, None
+
 
 def _expiry_days_validation_error(expires_in_days: object) -> str | None:
     """Valide une durée avant toute génération de secret.
@@ -420,6 +453,11 @@ class TokenService:
                 space_ids=[],
                 created_at=now_dt.isoformat(),
                 expires_at=expires_at,
+                # The delegated path is the agent path: the token refuses
+                # operator tools and no caller can ask otherwise here, so a
+                # manager that is refused operator tools cannot mint a token
+                # that is allowed them (specs/002-operator-tool-guard).
+                operator_tools=False,
             )
             store.tokens.append(token_info)
 
@@ -484,6 +522,7 @@ class TokenService:
             "permissions": list(perm_list),
             "space_ids": [],
             "expires_at": expires_at,
+            "operator_tools": False,
             "warning": "Save this token now; it will not be shown again.",
             "warning_no_access": (
                 "This token cannot access any space. An authorized manager must "
@@ -612,12 +651,17 @@ class TokenService:
         space_ids: str = "",
         expires_in_days: int = 0,
         email: str = "",
+        operator_tools: bool = True,
     ) -> dict:
         """
         Crée un nouveau token d'authentification.
 
         Le token en clair est retourné UNE SEULE FOIS. Seul le hash
         SHA-256 est stocké dans tokens.json.
+
+        ``operator_tools`` (specs/002-operator-tool-guard) : ce chemin est
+        réservé aux admins (chemin opérateur), le défaut reste donc ``True`` ;
+        un admin passe ``False`` pour un token destiné à un agent.
 
         Args:
             name: Nom descriptif (ex: "agent-cline")
@@ -658,6 +702,11 @@ class TokenService:
         # scope. Never mint a token that cannot be isolated as an agent.
         if not isinstance(name, str) or name == "":
             return {"status": "error", "message": "Token name is required"}
+        if not isinstance(operator_tools, bool):
+            return {
+                "status": "error",
+                "message": "Invalid operator_tools: expected true or false",
+            }
 
         # Parser et valider les permissions
         if not isinstance(permissions, str):
@@ -727,6 +776,7 @@ class TokenService:
                 space_ids=sid_list,
                 created_at=now.isoformat(),
                 expires_at=expires_at,
+                operator_tools=operator_tools,
             )
             store.tokens.append(token_info)
             try:
@@ -774,6 +824,7 @@ class TokenService:
             "permissions": perm_list,
             "space_ids": sid_list,
             "expires_at": expires_at,
+            "operator_tools": operator_tools,
             "warning": "Save this token now; it will not be shown again.",
         }
 
@@ -991,6 +1042,7 @@ class TokenService:
                     "expires_at": t.expires_at,
                     "last_used_at": t.last_used_at,
                     "revoked": t.revoked,
+                    "operator_tools": t.operator_tools,
                 }
             )
 
@@ -1239,9 +1291,12 @@ class TokenService:
         email: str = "",
         space_ids_add: str = "",
         space_ids_remove: str = "",
+        operator_tools: str = "",
     ) -> dict:
         """
-        Met à jour un token : permissions, email, et/ou ``space_ids``.
+        Met à jour un token : permissions, email, ``space_ids`` et/ou
+        ``operator_tools`` (texte ``"true"``/``"false"``, vide = inchangé ;
+        specs/002-operator-tool-guard).
 
         **Trois modes pour ``space_ids``** (issue #13) :
 
@@ -1287,6 +1342,9 @@ class TokenService:
         )
         if mutex_err:
             return mutex_err
+        new_operator_tools, operator_tools_err = _parse_operator_tools(operator_tools)
+        if operator_tools_err:
+            return operator_tools_err
 
         # Pré-résoudre le sucre "*"/"all" hors du lock pour éviter
         # de tenir le verrou pendant un appel S3 (list_spaces).
@@ -1366,6 +1424,13 @@ class TokenService:
                 token.space_ids = []
             if email:
                 token.email = email
+            before_operator_tools = token.operator_tools
+            operator_tools_changed = (
+                new_operator_tools is not None
+                and new_operator_tools != before_operator_tools
+            )
+            if operator_tools_changed:
+                token.operator_tools = new_operator_tools
 
             await self._save_store(store)
             # Snapshot des champs nécessaires pour la réponse (avant sortie du lock)
@@ -1373,17 +1438,26 @@ class TokenService:
             updated_hash = token.hash
             updated_space_ids = list(token.space_ids)
             updated_perms = list(token.permissions)
+            updated_operator_tools = token.operator_tools
 
         # LM2-07 fix : purger le store global si les droits effectifs ont
-        # été modifiés (permissions ou space_ids). L'email seul n'affecte
-        # pas l'autorisation runtime → pas d'invalidation nécessaire.
-        if permissions or new_space_ids is not None or delta_mode:
+        # été modifiés (permissions, space_ids ou operator_tools). L'email seul
+        # n'affecte pas l'autorisation runtime → pas d'invalidation nécessaire.
+        if (
+            permissions
+            or new_space_ids is not None
+            or delta_mode
+            or operator_tools_changed
+        ):
             self._invalidate_in_fresh_store([updated_hash])
 
         response = {
             "status": "ok",
             "message": f"Token '{updated_name}' updated",
         }
+        if operator_tools_changed:
+            response["operator_tools_before"] = before_operator_tools
+            response["operator_tools_after"] = updated_operator_tools
 
         if _authorization_profile_changed(
             before_permissions,
@@ -1452,9 +1526,13 @@ class TokenService:
         space_ids_add: str = "",
         space_ids_remove: str = "",
         include_revoked: bool = False,
+        operator_tools: str = "",
     ) -> dict:
         """
         Met à jour plusieurs tokens en une seule opération (issue #13).
+
+        ``operator_tools`` (texte ``"true"``/``"false"``, vide = inchangé)
+        compte comme une opération (specs/002-operator-tool-guard).
 
         **Atomicité** : tokens.json est un fichier S3 unique chargé/sauvé
         sous lock asyncio. Toutes les modifications sont appliquées en
@@ -1551,13 +1629,19 @@ class TokenService:
         op_email = (email or "").strip()
         add_list = self._parse_csv_spaces(space_ids_add)
         remove_list = self._parse_csv_spaces(space_ids_remove)
+        op_operator_tools, operator_tools_err = _parse_operator_tools(operator_tools)
+        if operator_tools_err:
+            return operator_tools_err
 
-        if not (op_perm or op_email or add_list or remove_list):
+        if not (
+            op_perm or op_email or add_list or remove_list or op_operator_tools is not None
+        ):
             return {
                 "status": "error",
                 "message": (
                     "No operation was requested. Provide at least one of "
-                    "`permissions`, `email`, `space_ids_add`, or `space_ids_remove`."
+                    "`permissions`, `email`, `space_ids_add`, `space_ids_remove`, "
+                    "or `operator_tools`."
                 ),
             }
 
@@ -1636,12 +1720,15 @@ class TokenService:
                 before_space_ids = list(t.space_ids)
                 before_perms = list(t.permissions)
                 before_email = t.email
+                before_operator_tools = t.operator_tools
                 before_is_admin = "admin" in set(before_perms)
 
                 if perm_list is not None:
                     t.permissions = list(perm_list)
                 if op_email:
                     t.email = op_email
+                if op_operator_tools is not None:
+                    t.operator_tools = op_operator_tools
 
                 added: list[str] = []
                 removed: list[str] = []
@@ -1671,11 +1758,13 @@ class TokenService:
                         "space_ids": before_space_ids,
                         "permissions": before_perms,
                         "email": before_email,
+                        "operator_tools": before_operator_tools,
                     },
                     "after": {
                         "space_ids": list(t.space_ids),
                         "permissions": list(t.permissions),
                         "email": t.email,
+                        "operator_tools": t.operator_tools,
                     },
                 }
                 if add_list or remove_list:
@@ -1689,10 +1778,18 @@ class TokenService:
             await self._save_store(store)
 
         # LM2-07 fix : purger le store global pour tous les tokens dont les
-        # droits ont été modifiés (permissions ou space_ids touchés). L'email
-        # seul n'affecte pas l'autorisation runtime → skip pour économiser.
-        if perm_list is not None or add_list or remove_list:
+        # droits ont été modifiés (permissions, space_ids ou operator_tools
+        # touchés). L'email seul n'affecte pas l'autorisation runtime → skip.
+        if perm_list is not None or add_list or remove_list or op_operator_tools is not None:
             self._invalidate_in_fresh_store([entry["hash"] for entry in report])
+
+        operations_block = {
+            "permissions": perm_list,
+            "email": op_email or None,
+            "space_ids_add": add_list,
+            "space_ids_remove": remove_list,
+            "operator_tools": op_operator_tools,
+        }
 
         # ─── Audit logging (review PR #14, point #4) ───
         # Émis APRÈS le save_store : on ne loggue que les opérations
@@ -1700,12 +1797,7 @@ class TokenService:
         # pas l'audit (ils ont leur retour MCP côté client).
         self._emit_bulk_update_audit(
             filters=filters_block,
-            operations={
-                "permissions": perm_list,
-                "email": op_email or None,
-                "space_ids_add": add_list,
-                "space_ids_remove": remove_list,
-            },
+            operations=dict(operations_block),
             updated=len(report),
             token_hashes=[entry["hash"] for entry in report],
             skipped_revoked=skipped_revoked,
@@ -1716,12 +1808,7 @@ class TokenService:
             "updated": len(report),
             "tokens": report,
             "filters": filters_block,
-            "operations": {
-                "permissions": perm_list,
-                "email": op_email or None,
-                "space_ids_add": add_list,
-                "space_ids_remove": remove_list,
-            },
+            "operations": dict(operations_block),
         }
         if any(
             _authorization_profile_changed(
@@ -1843,6 +1930,7 @@ class TokenService:
                 "permissions": t.permissions,
                 "allowed_resources": t.space_ids,
                 "token_hash": t.hash,
+                "operator_tools": t.operator_tools,
             }
 
         return None  # Token inconnu
@@ -2029,6 +2117,13 @@ class TokenService:
             if "revoked" in raw_token and not isinstance(raw_token["revoked"], bool):
                 raise RuntimeError(
                     f"Corrupt token registry: boolean revoked required for {label}"
+                )
+            if "operator_tools" in raw_token and not isinstance(
+                raw_token["operator_tools"], bool
+            ):
+                raise RuntimeError(
+                    "Corrupt token registry: boolean operator_tools required "
+                    f"for {label}"
                 )
             if "expires_at" in raw_token and not (
                 raw_token["expires_at"] is None

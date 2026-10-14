@@ -97,7 +97,7 @@ SHELL_COMMANDS = {
     "bank repair": "Repair corrupted names (bank repair <space> [--apply]) manage",
     "bank compact": "Scan files; apply only on DirectLocal routes (bank compact <space> [--apply]) manage",
     "token create": "Create a token (token create <name> -p <read|read,write|read,write,manage|...admin> [--email <email>])",
-    "token update": "Update a token (token update <hash> [--permissions ...] [--space-ids ... | --add-spaces ... --remove-spaces ...])",
+    "token update": "Update a token (token update <hash> [--permissions ...] [--space-ids ... | --add-spaces ... --remove-spaces ...] [--operator-tools true|false])",
     "token list": "List tokens (token list [--name-contains x] [--has-space y] [--no-revoked])",
     "token bulk-update": "Update N tokens (token bulk-update --name-contains agent --add-spaces new --confirm) issue #13",
     "token revoke": "Revoke a token (token revoke <hash>)",
@@ -991,15 +991,23 @@ async def _handle_token(client, args, json_out):
             elif flag in ("--email", "-e") and i + 1 < len(remaining):
                 mcp_args["email"] = remaining[i + 1]
                 i += 2
+            elif flag == "--operator-tools" and i + 1 < len(remaining):
+                value = remaining[i + 1].strip().lower()
+                if value not in ("true", "false"):
+                    show_error("--operator-tools expects true or false")
+                    return
+                mcp_args["operator_tools"] = value
+                i += 2
             else:
                 i += 1
         if len(mcp_args) <= 1:
             show_error(
                 "Nothing to update. Use --permissions, --space-ids, "
-                "--add-spaces, --remove-spaces and/or --email."
+                "--add-spaces, --remove-spaces, --email and/or --operator-tools."
             )
             show_warning("Ex: token update sha256:a8c5 --email user@example.com")
             show_warning("Ex: token update sha256:a8c5 -a new-space  (delta)")
+            show_warning("Ex: token update sha256:a8c5 --operator-tools false")
             return
         # Client-side guard: replacement and delta are incompatible
         if "space_ids" in mcp_args and (

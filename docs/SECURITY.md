@@ -278,7 +278,10 @@ defense-in-depth in a public deployment.
     one opaque failure for invalid/protected targets;
   * both operations revalidate the persisted actor while the token-store lock
     is held. Revoked, expired, downgraded, or re-scoped callers fail closed;
-  * existing global list/update/revoke/delete/purge/bulk tools remain admin-only.
+  * existing global list/update/revoke/delete/purge/bulk tools remain admin-only;
+  * a token created by `token_create` refuses the hidden operator tools over
+    MCP (§3.13), and `token_create` has no parameter to lift that, so a
+    manager that is itself refused operator tools cannot delegate them.
 * **Deployer responsibility**:
   * grant `manage` only to principals trusted to allocate storage prefixes and
     recursively delegate that capability;
@@ -451,6 +454,45 @@ treated the same way: it is retained in an explicit process-terminal
 quarantine, cleanup runs once, and the request gate remains permanently failed.
 The guard does not claim to forcibly kill Python code; process recycle is the
 only recovery boundary.
+
+### 3.13 Hidden operator tools are gated per bearer token, not per server
+
+* **Implemented surface**: the exposure registry marks 36 tools as
+  `audience=operator` (maintenance, backup, token lifecycle, recovery; see
+  [`TOOL_EXPOSURE.md`](TOOL_EXPOSURE.md)). They are not advertised by
+  `tools/list` but stay callable by exact name and by their historical
+  aliases. Hiding is not authorization: each handler checks its permission
+  level, so a `manage` token passes every operator tool whose minimum is
+  `manage` or lower. Each bearer token therefore carries an `operator_tools`
+  attribute, checked in one place before the handler runs, on `/mcp` and on
+  the console's `POST /api/tool` proxy (which accepts the same bearer token
+  in the `Authorization` header). The decision is keyed on the registry
+  audience, so an alias is gated like its canonical name and no name list is
+  kept by hand. A refused call returns `status: "forbidden"` with one fixed
+  message that names no other tool, and writes an `operator_tool_refused`
+  line to the `live_mem.audit` logger (name as called, canonical name, cause,
+  route, token name, authentication type; never an argument value).
+* **Trust assumption**: the attribute defaults by creation path, not by
+  permission level. `token_create` (the agent-facing provisioning tool, the
+  only one advertised to managers) always stores `false`;
+  `admin_create_token` (admin-only) stores `true` unless told otherwise; a
+  record stored before the attribute existed and the bootstrap key read as
+  allowed, so an upgrade changes nothing for existing tokens. The attribute
+  is an additional gate: every handler keeps its own permission and space
+  checks. A missing identity is refused by the handler's own authentication
+  gate, as before.
+* **Deployer responsibility**:
+  * create agent tokens with `token_create` (manager caller) or with
+    `admin_create_token` and `operator_tools=false` (CLI
+    `token create ... --no-operator-tools`); keep operator credentials for
+    the CLI and the console allowed;
+  * after upgrading, review `admin_list_tokens` (CLI `token list`) and set
+    `operator_tools` to `false` on tokens that agents hold
+    (`token bulk-update --name-contains <agent prefix> --operator-tools false --confirm`),
+    because existing records are allowed by default;
+  * ship the `operator_tool_refused` audit lines with the rest of the
+    `audit_logger` output (§3.10); a burst of refusals from one token name
+    shows an agent that tries to reach operator tools.
 
 ---
 
