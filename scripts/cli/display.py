@@ -1366,6 +1366,9 @@ def show_token_created(result: dict):
         spaces_label = ", ".join(spaces)
     else:
         spaces_label = "none — grant with `space invite <space_id> <full_hash>`"
+    operator_tools_label = (
+        "refused" if result.get("operator_tools") is False else "allowed"
+    )
     hash_line = (
         f"[bold]Full hash:[/bold] [cyan]{result['token_hash']}[/cyan]\n"
         if result.get("token_hash")
@@ -1394,6 +1397,7 @@ def show_token_created(result: dict):
             f"{hash_line}"
             f"[bold]Perms:[/bold] {', '.join(permissions)}\n"
             f"[bold]Spaces:[/bold] {spaces_label}\n"
+            f"[bold]Operator tools over MCP:[/bold] {operator_tools_label}\n"
             f"[bold]Expires:[/bold] {_format_local_timestamp(result.get('expires_at')) or 'never'}\n\n"
             f"{recovery_warning}"
             f"{server_notes}\n"
@@ -1407,6 +1411,9 @@ def show_token_created(result: dict):
 def show_token_updated(result: dict):
     """Display a token update without hiding server transition guidance."""
     show_success(result.get("message", "Token updated"))
+    if "operator_tools_after" in result:
+        label = "allowed" if result["operator_tools_after"] else "refused"
+        console.print(f"Operator tools over MCP: {label}")
     if result.get("info"):
         console.print(str(result["info"]))
     if result.get("warning_no_access"):
@@ -1422,6 +1429,7 @@ def show_token_list(result: dict):
     table.add_column("Hash (ID)", style="dim")
     table.add_column("Permissions")
     table.add_column("Spaces")
+    table.add_column("Operator tools", min_width=14, no_wrap=True)
     table.add_column("Created (local)")
     table.add_column("Expires (local)")
     for t in tokens:
@@ -1430,6 +1438,8 @@ def show_token_list(result: dict):
         expires = _format_local_timestamp(expires, date_only=True) if expires else "never"
         is_admin_token = "admin" in t.get("permissions", [])
         spaces = ", ".join(t.get("space_ids", [])) or ("all" if is_admin_token else "none")
+        # A record without the attribute (created before the guard) is allowed.
+        operator_tools = "no" if t.get("operator_tools") is False else "yes"
         name = t.get("name", "?")
         if t.get("revoked"):
             name = f"[dim strikethrough]{name}[/dim strikethrough]"
@@ -1443,6 +1453,7 @@ def show_token_list(result: dict):
             token_hash,
             ", ".join(t.get("permissions", [])),
             spaces,
+            operator_tools,
             created,
             expires,
         )
@@ -1490,6 +1501,8 @@ def show_bulk_update_result(result: dict):
         op_parts.append(f"perms={operations['permissions']}")
     if operations.get("email"):
         op_parts.append(f"email={operations['email']}")
+    if operations.get("operator_tools") is not None:
+        op_parts.append(f"operator_tools={operations['operator_tools']}")
     if op_parts:
         console.print(f"[dim]Operations: {', '.join(op_parts)}[/dim]")
 

@@ -104,6 +104,19 @@ async def call_tool_direct(name: str, arguments: dict) -> dict:
     if name not in tools_dict:
         return {"status": "error", "message": f"Unknown tool: {name}"}
 
+    # Operator tool guard (specs/002-operator-tool-guard). This proxy never
+    # passes through HivemindMCPServer.call_tool, and the same bearer token
+    # is accepted here in the Authorization header, so the guard is applied
+    # on this route too. Operator tokens are allowed and keep every call.
+    from ..auth.context import get_effective_token_info
+    from .exposure import operator_tool_refusal
+
+    refusal = operator_tool_refusal(
+        name, get_effective_token_info(), route="api_tool", registered=True
+    )
+    if refusal is not None:
+        return refusal
+
     tool_obj = tools_dict[name]
 
     # Find the callable function on the internal tool object

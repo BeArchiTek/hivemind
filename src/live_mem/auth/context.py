@@ -44,6 +44,9 @@ _REQUEST_TOKEN_SCALAR_FIELDS = (
     "created_at",
     "expires_at",
     "last_used_at",
+    # Per-token operator tool guard (specs/002-operator-tool-guard): copied so
+    # the MCP request identity carries it; absent for the bootstrap key.
+    "operator_tools",
 )
 
 # VULN-08 fix : regex de validation du space_id, appliquée dans check_access()

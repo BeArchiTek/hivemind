@@ -214,5 +214,21 @@
       "tags"
     ],
     "agent_parameter_forbidden": true
+  },
+  "operator_tool_guard": {
+    "_comment": "Per-bearer-token guard for audience=operator tools (specs/002-operator-tool-guard). Each stored token carries a boolean attribute; a record without it reads as allowed so tokens created before the guard keep calling operator tools. token_create always stores false and has no parameter for it; admin_create_token stores true unless told otherwise. The three admin tools listed accept the parameter. Changing any value here is a deliberate contract change that must be justified in the pull request.",
+    "token_attribute": "operator_tools",
+    "absent_record_reads_as": true,
+    "creation_defaults": {
+      "token_create": false,
+      "admin_create_token": true
+    },
+    "tools_with_parameter": [
+      "admin_create_token",
+      "admin_update_token",
+      "admin_bulk_update_tokens"
+    ],
+    "refusal_status": "forbidden",
+    "refusal_cause": "operator_tools_refused"
   }
 }

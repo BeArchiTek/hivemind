@@ -10,14 +10,19 @@ P10-1 contract: ``DESIGN/hivemind/P10_MCP_DISCOVERY_CONTRACT.md``.
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.types import CallToolResult, InputRequiredResult
 from mcp.types import Tool as MCPTool
+
+_audit_logger = logging.getLogger("live_mem.audit")
 
 
 class ToolAudience(StrEnum):
@@ -954,14 +959,145 @@ def validate_tool_exposure_registry(
                     )
 
 
-class HivemindMCPServer(MCPServer):
-    """MCPServer whose low-level list handler is permission-aware by construction.
+# ---------------------------------------------------------------------------
+# Per-bearer-token guard for operator tools (specs/002-operator-tool-guard)
+# ---------------------------------------------------------------------------
+#
+# Hiding ``audience=operator`` names from discovery is not authorization.  Each
+# bearer token carries an ``operator_tools`` attribute; the guard below reads
+# the audience from this registry (so every alias is covered and no name list
+# is kept by hand) and refuses the call before the handler runs when the token
+# is not allowed operator tools.  Every handler keeps its own permission and
+# space checks: the guard is an additional gate, never a replacement.
 
-    ``MCPServer.__init__`` binds ``self.list_tools`` while setting up protocol
-    handlers.  Overriding the method on the class (instead of monkey-patching an
-    instance later) guarantees the low-level ``tools/list`` handler receives the
-    Hivemind projection.
+OPERATOR_TOOLS_REFUSED = "operator_tools_refused"
+AUDIENCE_UNRESOLVED = "audience_unresolved"
+OPERATOR_TOOL_REFUSAL: Mapping[str, str] = MappingProxyType(
+    {
+        "status": "forbidden",
+        "message": (
+            "This tool is reserved for operators. Ask an operator to perform the "
+            "action through the admin console or the CLI with an operator token."
+        ),
+    }
+)
+
+_EXPOSURE_BY_REGISTERED_NAME: Mapping[str, ToolExposure] = exposure_by_registered_name()
+
+
+def token_allows_operator_tools(token_info: Mapping[str, Any] | None) -> bool:
+    """Read the per-token attribute, failing closed on anything unexpected.
+
+    A missing identity refuses.  A missing attribute reads as allowed: records
+    written before the attribute existed (and the bootstrap key, which has no
+    record) keep today's behaviour.  Any value other than a boolean refuses.
     """
+
+    if not isinstance(token_info, Mapping):
+        return False
+    if "operator_tools" not in token_info:
+        return True
+    value = token_info["operator_tools"]
+    return value is True
+
+
+def _audit_operator_tool_refusal(
+    *,
+    name: str,
+    canonical: str | None,
+    cause: str,
+    route: str,
+    token_info: Mapping[str, Any] | None,
+) -> None:
+    """Write one audit line per refusal; never an argument value or a secret."""
+
+    try:
+        from ..middleware import current_request_id
+
+        request_id = current_request_id.get()
+    except Exception:  # pragma: no cover - audit must never break the call
+        request_id = "-"
+    entry = {
+        "event": "operator_tool_refused",
+        "request_id": request_id,
+        "route": route,
+        "tool": name,
+        "canonical_tool": canonical,
+        "cause": cause,
+        "client": token_info.get("client_name") if isinstance(token_info, Mapping) else None,
+        "auth_type": token_info.get("type") if isinstance(token_info, Mapping) else None,
+    }
+    try:
+        _audit_logger.info(json.dumps(entry, ensure_ascii=False))
+    except Exception:  # pragma: no cover - audit must never break the call
+        pass
+
+
+def operator_tool_refusal(
+    name: str,
+    token_info: Mapping[str, Any] | None,
+    *,
+    route: str,
+    registered: bool,
+) -> Optional[dict[str, str]]:
+    """Return the refusal result for ``name``, or ``None`` when the call may proceed.
+
+    ``registered`` says whether the tool manager knows ``name``: an unknown
+    name is left to the caller, which answers "Unknown tool" exactly as before.
+    With no identity there is no attribute to read: the handler's own
+    authentication gate refuses the call, as it does today (every registered
+    handler has one, pinned by ``tests/test_mcp_tool_surface.py``).  A
+    registered name without a registry entry has no audience and is refused
+    (``audience_unresolved``); startup validation makes this unreachable in a
+    served process, but the guard does not rely on it.
+    """
+
+    if not registered or token_info is None:
+        return None
+    entry = _EXPOSURE_BY_REGISTERED_NAME.get(name)
+    if entry is None:
+        cause, canonical = AUDIENCE_UNRESOLVED, None
+    elif entry.audience is not ToolAudience.OPERATOR:
+        return None
+    elif token_allows_operator_tools(token_info):
+        return None
+    else:
+        cause, canonical = OPERATOR_TOOLS_REFUSED, entry.canonical_name
+    _audit_operator_tool_refusal(
+        name=name, canonical=canonical, cause=cause, route=route, token_info=token_info
+    )
+    return dict(OPERATOR_TOOL_REFUSAL)
+
+
+class HivemindMCPServer(MCPServer):
+    """MCPServer whose low-level handlers are identity-aware by construction.
+
+    ``MCPServer.__init__`` binds ``self.list_tools`` and ``self.call_tool``
+    while setting up protocol handlers.  Overriding the methods on the class
+    (instead of monkey-patching an instance later) guarantees the low-level
+    ``tools/list`` handler receives the Hivemind projection and the low-level
+    ``tools/call`` handler passes through the operator tool guard.
+    """
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        context: Context[Any, Any] | None = None,
+    ) -> CallToolResult | InputRequiredResult:
+        from ..auth.context import get_mcp_request_token_info
+
+        tool = self._tool_manager.get_tool(name)
+        _has_mcp_context, token_info = get_mcp_request_token_info()
+        refusal = operator_tool_refusal(
+            name, token_info, route="mcp", registered=tool is not None
+        )
+        if refusal is not None:
+            assert tool is not None  # registered=True above
+            # Rendered through the tool's own converter so the client sees the
+            # exact shape of a handler refusal.
+            return tool.fn_metadata.convert_result(refusal)
+        return await super().call_tool(name, arguments, context)
 
     async def list_tools(self) -> list[MCPTool]:
         from ..auth.context import get_mcp_request_token_info

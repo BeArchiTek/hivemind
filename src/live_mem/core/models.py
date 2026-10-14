@@ -276,6 +276,12 @@ class TokenInfo(BaseModel):
     expires_at: Optional[str] = None  # ISO 8601 ou None (jamais)
     last_used_at: Optional[str] = None
     revoked: bool = False
+    # Whether the bearer token may call ``audience=operator`` tools over /mcp
+    # and /api/tool. A record written before the attribute existed has no key
+    # and reads as allowed, so an upgrade changes nothing for existing tokens.
+    # ``token_create`` stores False; ``admin_create_token`` stores True unless
+    # told otherwise (specs/002-operator-tool-guard).
+    operator_tools: bool = True
 
 
 class TokensStore(BaseModel):

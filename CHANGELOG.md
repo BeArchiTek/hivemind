@@ -17,6 +17,31 @@ linked guides when installing or upgrading.
 
 ### Added
 
+- Per-bearer-token guard for the hidden operator tools. Each token in
+  `_system/tokens.json` carries `operator_tools`; when it is `false`, every
+  `audience=operator` tool of `docs/TOOL_EXPOSURE.md` (`mid_write` and its
+  alias `bank_write`, `mid_delete`, `bank_compact`, `bank_repair`,
+  `space_update`, `space_export`, `space_delete`, `backup_*`, `admin_*`, and
+  the rest) is refused before its handler runs, over `/mcp` and over the
+  console's `POST /api/tool`, with
+  `{"status": "forbidden", "message": "This tool is reserved for operators. ..."}`
+  and one `operator_tool_refused` line on the `live_mem.audit` logger. The
+  decision reads the registry audience, so aliases are covered and no name
+  list is kept by hand; each handler keeps its own permission checks.
+  Tokens stored before this release have no attribute and keep calling
+  operator tools, so upgrading changes nothing for existing credentials.
+  `token_create` always stores `false` and takes no parameter for it;
+  `admin_create_token` stores `true` unless called with
+  `operator_tools=false`. `admin_update_token` and `admin_bulk_update_tokens`
+  take `operator_tools` (`"true"` / `"false"`); `admin_list_tokens` and
+  `system_whoami` report it. The CLI gains `token create --operator-tools /
+  --no-operator-tools` (admin and bootstrap callers), `token update
+  --operator-tools true|false`, `token bulk-update --operator-tools
+  true|false` and an "Operator tools" column in `token list`; the admin
+  console shows the attribute in the Access view and lets an admin set it in
+  the create and edit forms. Documented in `docs/MCP_TOOLS_SPEC.md`,
+  `docs/DEPLOYMENT.md`, `docs/SECURITY.md` (3.13) and `docs/TOOL_EXPOSURE.md`.
+
 - Explicit MCP session limits on both runtimes (SDK 2). `MCP_MAX_SESSIONS`
   (default 10000) and `MCP_SESSION_IDLE_TIMEOUT_SECONDS` (default 1800) are
   now passed to the SDK by the core server and the embedded Graph Memory

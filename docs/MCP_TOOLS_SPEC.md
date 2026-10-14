@@ -85,6 +85,49 @@ discovery. The total registry, exact profile lists, and console rendering hints
 are generated in [`TOOL_EXPOSURE.md`](TOOL_EXPOSURE.md); the independent
 complete registration baseline remains `tests/fixtures/tool_surface.json`.
 
+#### Operator tools are gated per bearer token
+
+Every registry entry whose audience is `operator` (the hidden maintenance,
+backup, token and recovery tools listed in
+[`TOOL_EXPOSURE.md`](TOOL_EXPOSURE.md)) is also gated by a per-token attribute,
+`operator_tools`, before its handler runs. The gate reads the audience from the
+registry, so it covers every canonical name and every historical alias
+(`bank_write` is gated exactly like `mid_write`) without a separate name list.
+It applies on `/mcp` and on the admin console's `POST /api/tool` proxy, which
+accepts the same bearer token. The handler's own permission and space checks
+run unchanged after the gate.
+
+- A token whose attribute is `false` receives, for any operator tool and
+  whatever permission the handler would require:
+
+  ```json
+  {
+    "status": "forbidden",
+    "message": "This tool is reserved for operators. Ask an operator to perform the action through the admin console or the CLI with an operator token."
+  }
+  ```
+
+  The message is the same for every operator tool and names no other tool.
+  The server writes one `live_mem.audit` line per refusal
+  (`"event": "operator_tool_refused"`, with the name as called, the canonical
+  name, the cause `operator_tools_refused`, the route, the token name and the
+  authentication type; never an argument value).
+- A token whose attribute is `true`, a token stored before the attribute
+  existed (no key in `_system/tokens.json`), and the bootstrap key are not
+  refused by the gate.
+- `token_create` always stores `false` and has no parameter to change it, so a
+  manager that is refused operator tools cannot create a token that is allowed
+  them. `admin_create_token` stores `true` unless called with
+  `operator_tools=false`. `admin_update_token` and `admin_bulk_update_tokens`
+  change it; `admin_list_tokens` and `system_whoami` show it. A change takes
+  effect on the token's next call without reconnecting.
+- A name that is not registered is answered as before ("Unknown tool").
+  Discovery does not change.
+
+The refusal keeps the result convention above; the structured guidance fields
+planned for refused calls (`error_kind`, `remediation`) will name this cause
+`operator_tools_refused`.
+
 ### Tier grammar (ADR-0002)
 
 The `live_*` / `bank_*` / `graph_*` tools map to the public `short` / `mid` /
@@ -260,7 +303,9 @@ async def inference_self_test() -> dict:
 
 Identity of the current token used to reach the server. Returns `client_name`
 (= agent identity, Token=Agent), `auth_type` (`bootstrap` or `token`),
-`permissions`, `allowed_spaces`, and — for S3-stored tokens — token metadata
+`permissions`, `allowed_spaces`, `operator_tools` (whether the token may call
+operator tools over MCP; `true` for the bootstrap key and for tokens stored
+without the attribute), and — for S3-stored tokens — token metadata
 (email, created/expires dates). Requires a valid authentication (read minimum).
 
 ```python
@@ -639,7 +684,12 @@ permission, the reserved name `internal-long`, and an `expires_in_days` that is
 not a non-boolean integer `>= 0` or cannot be represented as a datetime, before
 generating a secret. `0` alone means no expiration.
 It has no `space_ids` or wildcard input: every token starts with
-`space_ids: []` and must later be invited one space at a time.
+`space_ids: []` and must later be invited one space at a time. Every token it
+creates refuses operator tools over MCP (`operator_tools: false`, see
+"Operator tools are gated per bearer token" above); the tool has no parameter
+to change that, so a caller that is itself refused operator tools cannot mint
+a token that is allowed them. An admin can change the attribute later with
+`admin_update_token`.
 
 Success returns the plaintext bearer token and full SHA-256 hash exactly once:
 
@@ -652,6 +702,7 @@ Success returns the plaintext bearer token and full SHA-256 hash exactly once:
   "permissions": ["read", "write"],
   "space_ids": [],
   "expires_at": null,
+  "operator_tools": false,
   "warning": "Save this token now; it will not be shown again.",
   "warning_no_access": "This token has no space access until invited."
 }
@@ -2213,14 +2264,18 @@ async def admin_create_token(
     permissions: str,        # Explicit subset of read/write/manage/admin
     space_ids: str = "",     # non-admin: empty=none, */all=snapshot; admin: ignored/stored []
     expires_in_days: int = 0, # 0 = no expiration
-    email: str = ""          # Optional owner metadata
+    email: str = "",         # Optional owner metadata
+    operator_tools: bool = True  # False for a token handed to an agent
 ) -> dict:
 ```
 
 The token is hashed with SHA-256 before storage in `_system/tokens.json`.
 Success returns the plaintext `token` and its canonical full `token_hash`
-additively in the same one-time response. The plaintext is never stored;
-clients should save both because `space_invite_token` requires the exact hash.
+additively in the same one-time response, plus `operator_tools`. The plaintext
+is never stored; clients should save both because `space_invite_token`
+requires the exact hash. This is the operator creation path: the token may
+call operator tools over MCP unless `operator_tools=false` is passed (see
+"Operator tools are gated per bearer token").
 `expires_in_days` follows the same strict contract as `token_create`: a
 non-boolean integer `>= 0`, representable as a datetime, with `0` alone meaning
 no expiration. Invalid or overflowing values are rejected before S3 access,
@@ -2245,7 +2300,8 @@ If admin creation receives a non-empty `space_ids`, success returns
 
 ### `admin_list_tokens` 👑
 
-Lists metadata of all tokens (never the token itself in clear text).
+Lists metadata of all tokens (never the token itself in clear text). Each
+entry carries `operator_tools`.
 
 ```python
 @mcp.tool()
@@ -2307,12 +2363,17 @@ async def admin_purge_tokens(
 
 ### `admin_update_token` 👑
 
-Updates a single token's `permissions`, `email`, and/or authorized `space_ids`.
-Three mutually-exclusive `space_ids` modes:
+Updates a single token's `permissions`, `email`, authorized `space_ids` and/or
+`operator_tools`. Three mutually-exclusive `space_ids` modes:
 (1) no change; (2) full replacement via `space_ids` (CSV, or `*`/`all` snapshot —
 risk of silent revocation); (3) idempotent delta via `space_ids_add` /
 `space_ids_remove` (remove applied before add). Returns `warning_no_access` if the
-update leaves the token with no readable space.
+update leaves the token with no readable space. `operator_tools` takes `"true"`
+or `"false"`; empty leaves it unchanged, other text is refused before the store
+is read. When it changes, the response carries `operator_tools_before` and
+`operator_tools_after`, the cached identity is invalidated so the next call
+uses the new value, and `mcp_reconnect_required` is not set because discovery
+does not depend on it.
 
 Under the v2 admin-empty-scope invariant, promotion to admin clears the
 allowlist. Downgrade from admin starts from `[]`; absent an explicit scope
@@ -2326,7 +2387,8 @@ async def admin_update_token(
     permissions: str = "",       # CSV subset; standard profiles through "read,write,manage,admin"; empty = no change
     email: str = "",             # New owner email; empty = no change
     space_ids_add: str = "",     # DELTA mode: spaces to add (CSV, idempotent)
-    space_ids_remove: str = ""   # DELTA mode: spaces to remove (CSV, idempotent)
+    space_ids_remove: str = "",  # DELTA mode: spaces to remove (CSV, idempotent)
+    operator_tools: str = ""     # "true" / "false"; empty = no change
 ) -> dict:
 ```
 
@@ -2339,9 +2401,11 @@ async def admin_update_token(
 Updates **many** tokens in one call. Selects tokens by an AND-combination of
 filters (at least one required): `names` (exact CSV), `name_contains`
 (case-insensitive substring), `has_space` (exact, case-sensitive `space_id`
-membership). Applies `permissions`, `email`, and/or idempotent `space_ids_add` /
+membership). Applies `permissions`, `email`, `operator_tools` (`"true"` /
+`"false"`, counted as an operation) and/or idempotent `space_ids_add` /
 `space_ids_remove` (the `*`/`all` sugar is forbidden here). Revoked tokens are
-excluded unless `include_revoked=True` (default `False`).
+excluded unless `include_revoked=True` (default `False`). Each reported
+token's `before` and `after` objects carry `operator_tools`.
 
 The same transition invariant applies in bulk: promotion clears scopes;
 downgrade from admin applies any delta to `[]`, never to a dormant allowlist.
@@ -2356,7 +2420,8 @@ async def admin_bulk_update_tokens(
     email: str = "",             # New email to apply; empty = no change
     space_ids_add: str = "",     # Spaces to add (CSV, idempotent)
     space_ids_remove: str = "",  # Spaces to remove (CSV, idempotent)
-    include_revoked: bool = False # Include revoked tokens in the selection
+    include_revoked: bool = False, # Include revoked tokens in the selection
+    operator_tools: str = ""     # "true" / "false"; empty = no change
 ) -> dict:
 ```
 
