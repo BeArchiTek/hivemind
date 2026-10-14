@@ -163,7 +163,13 @@ class ConsolidationQueueService:
                 if agent:
                     existing_id = self._find_pending_job(space_id, agent)
                     if existing_id:
-                        return self._job_payload(self._jobs[existing_id])
+                        # FR-007: acknowledge the existing job; no second job.
+                        existing = self._job_payload(self._jobs[existing_id])
+                        existing["existing_job"] = {
+                            "job_id": existing["job_id"],
+                            "status": existing["status"],
+                        }
+                        return existing
 
                 job_id = f"consol_{uuid.uuid4().hex}"
                 job = ConsolidationJob(
@@ -432,6 +438,14 @@ class ConsolidationQueueService:
                         "status": "error",
                         "message": generic_message,
                         "failure_reason": "consolidation_crashed",
+                        "error_kind": "internal_failure",
+                        "remediation": {
+                            "reason": (
+                                "The server logged the failure under the "
+                                "request identifier; report it to an operator."
+                            ),
+                            "retryable": False,
+                        },
                     }
                     # P12-1 : même contrat de phase terminale sur le chemin
                     # d'exception — le job ne reste jamais figé sur une phase

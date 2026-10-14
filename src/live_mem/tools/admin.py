@@ -49,9 +49,7 @@ def register(mcp: MCPServer) -> int:
             str,
             Field(
                 description=(
-                    "Comma-separated subset of read,write,manage,admin. Common "
-                    "profiles are 'read', 'read,write', 'read,write,manage', or "
-                    "'read,write,manage,admin'"
+                    "Comma-separated subset of read,write,manage,admin, for example 'read,write'; common profiles are 'read', 'read,write', 'read,write,manage' and 'read,write,manage,admin'"
                 )
             ),
         ],
@@ -60,11 +58,7 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "Comma-separated accessible spaces. Empty grants no access "
-                    "to existing spaces until a manager or administrator invites "
-                    "the token. Use '*' or 'all' for a snapshot of current spaces; "
-                    "future spaces are not added automatically. This value is "
-                    "ignored for admin tokens, whose scope is global."
+                    "Comma-separated accessible spaces, for example 'project-alpha,project-beta'; '*' or 'all' takes a snapshot of the current spaces; ignored for admin tokens, whose scope is global. Default: empty, no access until a manager or administrator invites the token"
                 ),
             ),
         ] = "",
@@ -73,13 +67,13 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default=0,
                 ge=0,
-                description="Validity period in days; 0 means no expiration",
+                description='Validity period in days, 0 or more; 0 means no expiration. Default: 0',
             ),
         ] = 0,
         email: Annotated[
             str,
             Field(
-                default="", description="Optional owner email for traceability"
+                default="", description="Owner email for traceability, for example 'owner@example.org'. Default: empty"
             ),
         ] = "",
         operator_tools: Annotated[
@@ -87,34 +81,12 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default=True,
                 description=(
-                    "Whether the token may call operator tools (the hidden "
-                    "maintenance, backup and token tools) over MCP. Default "
-                    "true for an operator credential; pass false for a token "
-                    "handed to an agent."
+                    'true lets the token call the operator tools (the hidden maintenance, backup and token tools) over MCP; false refuses them, which is the right value for a token handed to an agent. Default: true'
                 ),
             ),
         ] = True,
     ) -> dict:
-        """
-        Create an authentication token.
-
-        The plaintext token is returned only once. Only its SHA-256 hash is
-        stored.
-
-        Args:
-            name: Descriptive token name.
-            permissions: Comma-separated permission subset.
-            space_ids: Comma-separated spaces. Empty grants no space access;
-                ``*`` or ``all`` captures current spaces. Admin scope is global.
-            expires_in_days: Validity period in days; 0 means no expiration.
-            email: Optional owner email.
-            operator_tools: Whether the token may call operator tools over
-                MCP; default true, pass false for an agent token.
-
-        Returns:
-            Plaintext token, permissions, expiration and ``operator_tools``. A
-            ``warning_no_access`` field is included when a non-admin token has
-            no access to an existing space.
+        """Operator tool: not advertised in tools/list. Create a token with permissions, space scope and operator tool access; the plaintext token is returned once and only its hash is stored. Requires permission admin. A manager creates agent tokens with token_create.
         """
         from ..auth.context import check_admin_permission
         from ..core.tokens import get_token_service
@@ -144,8 +116,7 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "Filter by a case-insensitive substring of the token name. "
-                    "Empty disables this filter."
+                    "Case-insensitive substring of the token name, for example 'agent'. Default: empty, no filter"
                 ),
             ),
         ] = "",
@@ -154,8 +125,7 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "Filter tokens whose space_ids contain this exact, "
-                    "case-sensitive space identifier. Empty disables this filter."
+                    "Exact, case-sensitive space identifier that the token scope must contain, for example 'project-alpha'. Default: empty, no filter"
                 ),
             ),
         ] = "",
@@ -164,23 +134,12 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default=True,
                 description=(
-                    "Whether to include revoked tokens (default: true)"
+                    'true includes revoked tokens; false lists active tokens only. Default: true'
                 ),
             ),
         ] = True,
     ) -> dict:
-        """
-        List token metadata; plaintext credentials are never returned.
-
-        Optional filters are applied server-side and combine with AND semantics.
-
-        Args:
-            name_contains: Case-insensitive token-name substring.
-            has_space: Exact space identifier required in the token scope.
-            include_revoked: Whether to include revoked tokens.
-
-        Returns:
-            Token metadata and, when active, the applied filters.
+        """Operator tool: not advertised in tools/list. List token metadata with optional filters; plaintext credentials are never returned. Requires permission admin.
         """
         from ..auth.context import check_admin_permission
         from ..core.tokens import get_token_service
@@ -201,7 +160,6 @@ def register(mcp: MCPServer) -> int:
             return safe_error(e, "admin")
 
     @mcp.tool(
-        description="Return recent best-effort local audit events.",
         annotations=ToolAnnotations(readOnlyHint=True),
     )
     async def admin_audit_recent(
@@ -210,17 +168,12 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default=50,
                 description=(
-                    "Number of recent events (1..500, default 50). "
-                    "The value is bounded server-side."
+                    'Number of recent events, between 1 and 500. Default: 50'
                 ),
             ),
         ] = 50,
     ) -> dict:
-        """Retourne l'audit local récent de cette instance, plus récent d'abord.
-
-        Cette vue est volatile et best-effort : elle couvre seulement les
-        événements console/auth depuis le dernier redémarrage du processus.
-        Elle n'est ni persistante, ni une piste d'audit complète.
+        """Operator tool: not advertised in tools/list. Return the recent best-effort local audit events of this server instance. Requires permission admin.
         """
         from ..auth.context import check_admin_permission
         from ..core.audit_ring import AUDIT_SCOPE_NOTE, capacity, snapshot
@@ -245,7 +198,6 @@ def register(mcp: MCPServer) -> int:
             return safe_error(e, "admin")
 
     @mcp.tool(
-        description="Permanently revoke a token.",
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True),
     )
     async def admin_revoke_token(
@@ -253,21 +205,12 @@ def register(mcp: MCPServer) -> int:
             str,
             Field(
                 description=(
-                    "Hash of the token to revoke (from admin_list_tokens). "
-                    "The 'sha256:' prefix is optional; accepts either "
-                    "'sha256:abc...' or 'abc...'. At least 16 hex characters."
+                    "Token hash from admin_list_tokens, in the format sha256: followed by 64 lowercase hexadecimal characters; the 'sha256:' prefix is optional and at least 16 hexadecimal characters are required"
                 )
             ),
         ],
     ) -> dict:
-        """
-        Révoque un token (le rend définitivement inutilisable).
-
-        Args:
-            token_hash: Hash tronqué du token (depuis admin_list_tokens)
-
-        Returns:
-            Confirmation de révocation
+        """Operator tool: not advertised in tools/list. Permanently revoke a token by its hash. Requires permission admin.
         """
         from ..auth.context import check_admin_permission
         from ..core.tokens import get_token_service
@@ -284,7 +227,6 @@ def register(mcp: MCPServer) -> int:
             return safe_error(e, "admin")
 
     @mcp.tool(
-        description="Permanently delete a token from the registry.",
         annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True),
     )
     async def admin_delete_token(
@@ -292,27 +234,12 @@ def register(mcp: MCPServer) -> int:
             str,
             Field(
                 description=(
-                    "Hash of the token to delete (from admin_list_tokens). "
-                    "The 'sha256:' prefix is optional. At least 16 hex characters."
+                    "Token hash from admin_list_tokens, in the format sha256: followed by 64 lowercase hexadecimal characters; the 'sha256:' prefix is optional and at least 16 hexadecimal characters are required"
                 )
             ),
         ],
     ) -> dict:
-        """
-        Supprime physiquement un token du registre.
-
-        Contrairement à revoke_token qui marque le token comme inactif,
-        cette opération le retire complètement de tokens.json.
-        ⚠️ Opération irréversible.
-
-        Note: Le bootstrap key (variable d'environnement) n'est jamais
-        dans tokens.json et ne peut donc pas être supprimé.
-
-        Args:
-            token_hash: Hash tronqué du token (depuis admin_list_tokens)
-
-        Returns:
-            Confirmation de suppression avec nombre de tokens restants
+        """Operator tool: not advertised in tools/list. Permanently delete a token record by its hash. Requires permission admin.
         """
         from ..auth.context import check_admin_permission
         from ..core.tokens import get_token_service
@@ -334,7 +261,7 @@ def register(mcp: MCPServer) -> int:
             bool,
             Field(
                 default=True,
-                description="True deletes only revoked tokens; false deletes every stored token",
+                description='true deletes only revoked tokens; false deletes every stored token and requires confirm=true. Default: true',
             ),
         ] = True,
         confirm: Annotated[
@@ -342,28 +269,12 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default=False,
                 description=(
-                    "Required when revoked_only is false. Prevents accidental "
-                    "deletion of every token, which leaves bootstrap-only access."
+                    'true confirms the deletion of every token when revoked_only is false; false refuses it. Default: false'
                 ),
             ),
         ] = False,
     ) -> dict:
-        """
-        Permanently purge tokens from the registry.
-
-        By default, only revoked tokens are deleted. Setting
-        ``revoked_only=False`` deletes every stored token and requires an
-        explicit ``confirm=True`` acknowledgement.
-
-        This operation is irreversible. The configured bootstrap key is not
-        affected.
-
-        Args:
-            revoked_only: Delete only revoked tokens when true.
-            confirm: Must be true when deleting every token.
-
-        Returns:
-            Counts of deleted and remaining tokens.
+        """Operator tool: not advertised in tools/list. Permanently delete the revoked tokens, or every token when revoked_only=false with confirm=true. Requires permission admin. The bootstrap key is not affected.
         """
         from ..auth.context import check_admin_permission
         from ..core.tokens import get_token_service
@@ -377,16 +288,18 @@ def register(mcp: MCPServer) -> int:
             # La purge des seuls révoqués reste possible sans confirm (nettoyage
             # courant, non-destructeur pour les agents actifs).
             if not revoked_only and not confirm:
-                return {
-                    "status": "error",
-                    "message": (
+                from .guidance import confirm_required
+
+                return confirm_required(
+                    (
                         "Full purge refused: confirm=True is required when "
                         "revoked_only=False. This operation deletes ALL tokens "
                         "and leaves the server accessible only through the "
                         "bootstrap_key. If this is intended, call the tool "
                         "again with confirm=True."
                     ),
-                }
+                    "delete every token",
+                )
 
             return await get_token_service().purge_tokens(revoked_only=revoked_only)
         except Exception as e:
@@ -400,9 +313,7 @@ def register(mcp: MCPServer) -> int:
             str,
             Field(
                 description=(
-                    "Hash of the token to update, as returned by "
-                    "admin_list_tokens. The 'sha256:' prefix is optional; at "
-                    "least 16 hexadecimal characters are required."
+                    "Token hash from admin_list_tokens, in the format sha256: followed by 64 lowercase hexadecimal characters; the 'sha256:' prefix is optional and at least 16 hexadecimal characters are required"
                 )
             ),
         ],
@@ -411,10 +322,7 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "Replacement mode: complete comma-separated space scope. "
-                    "Empty leaves the scope unchanged. Use '*' or 'all' for a "
-                    "snapshot of current spaces. Prefer space_ids_add for a "
-                    "safe additive update."
+                    "Replacement mode: complete comma-separated space scope, for example 'project-alpha,project-beta'; '*' or 'all' takes a snapshot of the current spaces; prefer space_ids_add for a safe additive update. Default: empty, scope unchanged"
                 ),
             ),
         ] = "",
@@ -423,11 +331,7 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "New comma-separated subset of read,write,manage,admin. "
-                    "Common profiles include read, read,write, "
-                    "read,write,manage, and read,write,manage,admin. "
-                    "Empty leaves permissions unchanged. Promotion to admin "
-                    "clears the space scope; downgrade starts with an empty scope."
+                    "New comma-separated subset of read,write,manage,admin, for example 'read,write'; promotion to admin clears the space scope and a downgrade starts with an empty scope. Default: empty, permissions unchanged"
                 ),
             ),
         ] = "",
@@ -435,7 +339,7 @@ def register(mcp: MCPServer) -> int:
             str,
             Field(
                 default="",
-                description="New owner email; empty leaves it unchanged",
+                description="New owner email, for example 'owner@example.org'. Default: empty, unchanged",
             ),
         ] = "",
         space_ids_add: Annotated[
@@ -443,9 +347,7 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "Delta mode: comma-separated spaces to add. Idempotent and "
-                    "incompatible with replacement mode. '*' and 'all' are not "
-                    "accepted here."
+                    "Delta mode: comma-separated spaces to add, for example 'project-beta'; idempotent and incompatible with replacement mode; '*' and 'all' are not accepted. Default: empty"
                 ),
             ),
         ] = "",
@@ -454,8 +356,7 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "Delta mode: comma-separated spaces to remove. Idempotent; "
-                    "removals are applied before additions when both are supplied."
+                    "Delta mode: comma-separated spaces to remove, for example 'project-alpha'; idempotent; removals apply before additions. Default: empty"
                 ),
             ),
         ] = "",
@@ -464,38 +365,12 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "'true' lets the token call operator tools over MCP, "
-                    "'false' refuses them. Empty leaves the setting unchanged."
+                    "One of 'true' (the token may call operator tools over MCP) or 'false' (refused). Default: empty, unchanged"
                 ),
             ),
         ] = "",
     ) -> dict:
-        """
-        Update a token's permissions, email, space scope or operator tool
-        access.
-
-        Space scope has three modes:
-
-        1. No change when every ``space_ids*`` parameter is empty.
-        2. Complete replacement when ``space_ids`` is non-empty.
-        3. Idempotent delta through ``space_ids_add`` and
-           ``space_ids_remove``; removals are applied first.
-
-        Replacement and delta modes are mutually exclusive.
-
-        Args:
-            token_hash: Token hash returned by ``admin_list_tokens``.
-            space_ids: Complete replacement scope.
-            permissions: New permissions; empty leaves them unchanged.
-            email: New email; empty leaves it unchanged.
-            space_ids_add: Comma-separated spaces to add.
-            space_ids_remove: Comma-separated spaces to remove.
-            operator_tools: 'true' or 'false'; empty leaves it unchanged.
-
-        Returns:
-            Updated scope details, ``operator_tools_before`` and
-            ``operator_tools_after`` when that setting changed, and a warning
-            when the token has no access.
+        """Operator tool: not advertised in tools/list. Update the permissions, email, space scope or operator tool access of one token; the scope changes either by complete replacement (space_ids) or by delta (space_ids_add and space_ids_remove), never both. Requires permission admin.
         """
         from ..auth.context import check_admin_permission
         from ..core.tokens import get_token_service
@@ -526,10 +401,7 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "Comma-separated exact token names, for example "
-                    "'agent-laptop,agent-desktop,agent-ci'. Combines with "
-                    "name_contains and has_space using AND semantics. At least "
-                    "one selection filter is required."
+                    "Comma-separated exact token names, for example 'agent-laptop,agent-desktop'; combines with name_contains and has_space (AND); at least one selection filter is required. Default: empty"
                 ),
             ),
         ] = "",
@@ -538,9 +410,7 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "Case-insensitive token-name substring. Combines with names "
-                    "and has_space using AND semantics. At least one selection "
-                    "filter is required."
+                    "Case-insensitive token-name substring, for example 'agent'; combines with names and has_space (AND). Default: empty"
                 ),
             ),
         ] = "",
@@ -549,9 +419,7 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "Select tokens whose space_ids contain this exact, "
-                    "case-sensitive space identifier. Combines with other "
-                    "selection filters using AND semantics."
+                    "Exact, case-sensitive space identifier the token scope must contain, for example 'project-alpha'; combines with the other filters (AND). Default: empty"
                 ),
             ),
         ] = "",
@@ -560,11 +428,7 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "New comma-separated permission subset for selected tokens. "
-                    "Common profiles include read, read,write, "
-                    "read,write,manage, and read,write,manage,admin. "
-                    "Empty leaves permissions unchanged. Promotion to admin "
-                    "clears space scopes; downgrade applies deltas from an empty scope."
+                    "New comma-separated subset of read,write,manage,admin for the selected tokens, for example 'read,write'; promotion to admin clears the space scopes and a downgrade applies deltas from an empty scope. Default: empty, unchanged"
                 ),
             ),
         ] = "",
@@ -572,7 +436,7 @@ def register(mcp: MCPServer) -> int:
             str,
             Field(
                 default="",
-                description="New email for selected tokens; empty leaves it unchanged",
+                description="New email for the selected tokens, for example 'owner@example.org'. Default: empty, unchanged",
             ),
         ] = "",
         space_ids_add: Annotated[
@@ -580,7 +444,7 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "Comma-separated spaces to add. Idempotent; '*' and 'all' are not accepted."
+                    "Comma-separated spaces to add, for example 'project-beta'; idempotent; '*' and 'all' are not accepted. Default: empty"
                 ),
             ),
         ] = "",
@@ -589,7 +453,7 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "Comma-separated spaces to remove. Idempotent; '*' and 'all' are not accepted."
+                    "Comma-separated spaces to remove, for example 'project-alpha'; idempotent; '*' and 'all' are not accepted. Default: empty"
                 ),
             ),
         ] = "",
@@ -598,9 +462,7 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default=False,
                 description=(
-                    "Include revoked tokens in updates (default: false). "
-                    "Revoked matches that are not updated are returned in "
-                    "skipped_revoked."
+                    'true includes revoked tokens in the update; false skips them and returns them in skipped_revoked. Default: false'
                 ),
             ),
         ] = False,
@@ -609,39 +471,12 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "'true' lets the selected tokens call operator tools over "
-                    "MCP, 'false' refuses them. Empty leaves the setting "
-                    "unchanged."
+                    "One of 'true' (the selected tokens may call operator tools over MCP) or 'false' (refused). Default: empty, unchanged"
                 ),
             ),
         ] = "",
     ) -> dict:
-        """
-        Update multiple tokens in one operation.
-
-        Use additive scope deltas to grant or remove space access across a
-        selected set without rebuilding each token's complete scope. Complete
-        scope replacement is intentionally unavailable in bulk.
-
-        Validation and updates are applied in memory, then persisted in one
-        write under a process-local lock. An error before that write leaves the
-        registry unchanged. This atomicity applies within one server instance.
-
-        At least one of ``names``, ``name_contains``, or ``has_space`` is
-        required, and all supplied filters combine with AND semantics. Revoked
-        tokens are skipped by default; set ``include_revoked=True`` to update
-        them explicitly.
-
-        At least one update operation is required. Permission, email and
-        operator tool changes apply to every selected token; space additions
-        and removals are idempotent. A structured audit event is recorded after
-        persistence.
-
-        Returns:
-            ``{"status": "ok", "updated": N, "tokens": [{name, hash,
-            before: {...}, after: {...}, space_ids_added: [...], ...}],
-            "skipped_revoked": [...], "filters": {...}, "operations": {...}}``.
-            If no active token matches, ``updated`` is zero and status is ok.
+        """Operator tool: not advertised in tools/list. Update several tokens selected by names, name_contains or has_space in one persisted write; permission, email and operator tool changes apply to every selected token and space deltas are idempotent. Requires permission admin.
         """
         from ..auth.context import check_admin_permission
         from ..core.tokens import get_token_service
@@ -668,14 +503,13 @@ def register(mcp: MCPServer) -> int:
             return safe_error(e, "admin")
 
     @mcp.tool(
-        description="Scan, consolidate, or delete orphaned notes.",
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True),
     )
     async def admin_gc_notes(
         space_id: Annotated[
             str,
             Field(
-                default="", description="Target space (empty = scan ALL spaces)"
+                default="", description="Target space, for example 'project-alpha'. Default: empty, which scans every space"
             ),
         ] = "",
         max_age_days: Annotated[
@@ -683,21 +517,21 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default=7,
                 ge=0,
-                description="Age threshold in days for considering a note orphaned (default 7)",
+                description='Age in days from which a note is orphaned, 0 or more. Default: 7',
             ),
         ] = 7,
         confirm: Annotated[
             bool,
             Field(
                 default=False,
-                description="False = dry run (scan only); True = execute",
+                description='false runs a dry run (scan only); true consolidates, or deletes with delete_only. Default: false',
             ),
         ] = False,
         delete_only: Annotated[
             bool,
             Field(
                 default=False,
-                description="With confirm=True, delete WITHOUT consolidating (data loss)",
+                description='true deletes without consolidating (data loss) when confirm is true; false consolidates. Default: false',
             ),
         ] = False,
         expected_eligible_set_token: Annotated[
@@ -705,40 +539,19 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "Opaque precondition returned by the previous dry run; "
-                    "required with confirm=True + delete_only=True"
+                    'Opaque precondition returned by the previous dry run, in the format the dry run prints; required with confirm=true and delete_only=true. Default: empty'
                 ),
             ),
         ] = "",
     ) -> dict:
-        """
-        Garbage Collector : consolide ou supprime les notes orphelines.
-
-        Les notes live non consolidées par un agent disparu s'accumulent.
-        Cet outil les identifie (plus vieilles que max_age_days).
-
-        3 modes :
-        - confirm=False (défaut) : DRY-RUN — scanne et rapporte
-        - confirm=True : CONSOLIDE les notes dans la bank via LLM
-          (ajoute une notice "⚠️ GC consolidation forcée" dans chaque bank)
-        - confirm=True, delete_only=True : SUPPRIME sans consolider
-
-        Args:
-            space_id: Espace cible (vide = scanner TOUS les espaces)
-            max_age_days: Seuil en jours (défaut 7)
-            confirm: False = dry-run, True = exécution
-            delete_only: Si True + confirm, supprime SANS consolider
-            expected_eligible_set_token: Token exact de l'ensemble éligible
-                renvoyé par un dry-run préalable (suppression uniquement)
-
-        Returns:
-            Rapport : nombre de notes, taille, répartition par agent
+        """Operator tool: not advertised in tools/list. Scan (confirm=false), consolidate (confirm=true) or delete (confirm=true with delete_only=true and expected_eligible_set_token) the orphaned short-term notes older than max_age_days, in one space or in every space. Requires permission admin.
         """
         from ..auth.context import check_admin_permission
         from ..core.engines import RegistryRefused
         from ..core.gc import get_gc_service
         from ..core.hivemind import CorruptedStateError
         from ..core.write_sink import StagedWriteNotImplemented
+        from .guidance import write_route_refused
 
         try:
             admin_err = check_admin_permission()
@@ -750,11 +563,15 @@ def register(mcp: MCPServer) -> int:
             # Un seuil négatif déplacerait le cutoff dans le futur et pourrait
             # rendre éligibles des notes qui ne sont pas anciennes.
             if max_age_days < 0:
-                return {
-                    "status": "error",
-                    "reason": "invalid_max_age_days",
-                    "message": "max_age_days must be greater than or equal to 0.",
-                }
+                from .guidance import ErrorKind, argument_refusal
+
+                return argument_refusal(
+                    "max_age_days must be greater than or equal to 0.",
+                    kind=ErrorKind.INVALID_ARGUMENT,
+                    arguments=["max_age_days"],
+                    reason="max_age_days is a whole number of days, 0 or more, for example 30.",
+                    extra_fields={"reason": "invalid_max_age_days"},
+                )
 
             gc = get_gc_service()
 
@@ -792,32 +609,35 @@ def register(mcp: MCPServer) -> int:
                 return result
 
         except StagedWriteNotImplemented:
-            return {
-                "status": "error",
-                "reason": "route_staged_not_implemented",
-                "message": (
+            return write_route_refused(
+                (
                     "GC refused: staged Hivemind writes are not supported "
                     "for this operation."
                 ),
-            }
+                "The space is shared; an operator runs the GC on the space's "
+                "source node. Do not retry on another route.",
+                extra_fields={"reason": "route_staged_not_implemented"},
+            )
         except RegistryRefused:
-            return {
-                "status": "error",
-                "reason": "route_refused",
-                "message": (
+            return write_route_refused(
+                (
                     "GC refused: the space cannot be modified in its current "
                     "Hivemind state."
                 ),
-            }
+                "An operator resolves the space's recovery state (resync or "
+                "re-import) before the GC can run. Do not retry on another route.",
+                extra_fields={"reason": "route_refused"},
+            )
         except CorruptedStateError:
-            return {
-                "status": "error",
-                "reason": "state_corrupt",
-                "message": (
+            return write_route_refused(
+                (
                     "GC refused: the space's critical Hivemind state is "
                     "corrupted."
                 ),
-            }
+                "An operator repairs or resyncs the space's critical state "
+                "before the GC can run. Do not retry on another route.",
+                extra_fields={"reason": "state_corrupt"},
+            )
         except Exception as e:
             from ..auth.context import safe_error
 

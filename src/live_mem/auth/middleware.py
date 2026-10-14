@@ -346,6 +346,35 @@ class LoggingMiddleware:
                 logger.info(json.dumps(entry, ensure_ascii=False))
 
 
+def _record_api_tool_outcome(scope, tool_name: str, result) -> None:
+    """Write the tool outcome record for a refused ``/api/tool`` call.
+
+    This route never passes through ``HivemindMCPServer.call_tool``, so the
+    proxy writes the same ASGI state entry the conversion point writes, and
+    the audit entry and the counter cover console refusals too
+    (specification 001, FR-030). The response body is unchanged.
+    """
+    from ..tools.guidance import (
+        TOOL_OUTCOME_STATE_KEY,
+        ErrorKind,
+        canonical_tool_name,
+        is_refusal,
+    )
+
+    if not isinstance(scope, dict) or not is_refusal(result):
+        return
+    state = scope.get("state")
+    if not isinstance(state, dict):
+        return
+    kind = result.get("error_kind")
+    if not isinstance(kind, str) or kind not in {k.value for k in ErrorKind}:
+        kind = ErrorKind.UNCLASSIFIED_REFUSAL.value
+    state[TOOL_OUTCOME_STATE_KEY] = {
+        "tool": canonical_tool_name(tool_name),
+        "error_kind": kind,
+    }
+
+
 class StaticFilesMiddleware:
     """
     Middleware ASGI pour servir l'interface web et l'API REST.
@@ -412,7 +441,7 @@ class StaticFilesMiddleware:
 
         # API REST — Tool proxy (admin console)
         if path == "/api/tool" and method == "POST":
-            await self._api_tool_call(receive, send)
+            await self._api_tool_call(receive, send, scope=scope)
             return
 
         # API REST — Login (LM2-04 fix : émet un cookie HttpOnly)
@@ -549,7 +578,7 @@ class StaticFilesMiddleware:
 
     # ─────────────────── API Handlers ───────────────────
 
-    async def _api_tool_call(self, receive, send):
+    async def _api_tool_call(self, receive, send, scope=None):
         """
         POST /api/tool — proxies tool calls from the admin web UI.
 
@@ -645,6 +674,7 @@ class StaticFilesMiddleware:
             from ..tools import call_tool_direct
 
             result = await call_tool_direct(tool_name, arguments)
+            _record_api_tool_outcome(scope, tool_name, result)
             await self._send_json(send, result)
         except Exception as e:
             # ADM-02 fix: use safe_error() to prevent exception message leakage.

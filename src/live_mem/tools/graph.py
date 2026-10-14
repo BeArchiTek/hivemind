@@ -129,6 +129,63 @@ def _emit_long_ingest_volatile_optin_audit(
         pass
 
 
+from .guidance import ErrorKind, argument_refusal, refusal, remediation
+
+
+def _volatile_refusal(message: str, offending: list) -> dict:
+    """Volatile files need include_volatile=True and manage (specification 001)."""
+    return refusal(
+        message,
+        ErrorKind.PERMISSION_INSUFFICIENT,
+        rejected_volatile=offending,
+        required_permission="manage",
+        current_permissions=_current_permissions(),
+        remediation=remediation(
+            reason=(
+                "An operator with manage or admin passes include_volatile=true "
+                "to admit these files; agents leave volatile files out of "
+                "long-term memory."
+            ),
+            retryable=False,
+            arguments={"include_volatile": True},
+        ),
+    )
+
+
+def _current_permissions() -> list:
+    from ..auth.context import get_effective_token_info
+
+    token_info = get_effective_token_info() or {}
+    return [p for p in token_info.get("permissions", []) if isinstance(p, str)]
+
+
+def _job_id_refusal() -> dict:
+    return argument_refusal(
+        "job_id must be a non-empty string",
+        kind=ErrorKind.INVALID_ARGUMENT,
+        arguments=["job_id"],
+        reason="job_id is the identifier returned by long_ingest_async, for example 'ingest_1a2b3c'.",
+    )
+
+
+def _limit_refusal() -> dict:
+    return argument_refusal(
+        "limit must be an integer between 1 and 100",
+        kind=ErrorKind.INVALID_ARGUMENT,
+        arguments=["limit"],
+        reason="limit is a whole number between 1 and 100, for example 50.",
+    )
+
+
+def _offset_refusal() -> dict:
+    return argument_refusal(
+        "offset must be a non-negative integer",
+        kind=ErrorKind.INVALID_ARGUMENT,
+        arguments=["offset"],
+        reason="offset is a whole number, 0 or more, for example 0.",
+    )
+
+
 def register(mcp: MCPServer) -> int:
     """
     Enregistre les 7 outils graph sur l'instance MCP.
@@ -148,47 +205,29 @@ def register(mcp: MCPServer) -> int:
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
     async def graph_connect(
         space_id: Annotated[
-            str, Field(description="Space identifier")
+            str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")
         ],
         url: Annotated[
             str,
             Field(
-                description="Graph Memory URL, for example 'https://graph.example.com/mcp'"
+                description="Graph Memory MCP address, for example 'https://graph.example.com/mcp'"
             ),
         ],
         token: Annotated[
-            str, Field(description="Bearer token used to authenticate to Graph Memory")
+            str, Field(description='Bearer token used to authenticate to Graph Memory, in the format that service issues')
         ],
         memory_id: Annotated[
-            str, Field(description="Target memory identifier in Graph Memory")
+            str, Field(description="Target memory identifier in Graph Memory, for example 'project-alpha'")
         ],
         ontology: Annotated[
             str,
             Field(
                 default="general",
-                description="Extraction ontology: general|legal|cloud|managed-services|presales",
+                description="Extraction ontology, one of general|legal|cloud|managed-services|presales. Default: 'general'",
             ),
         ] = "general",
     ) -> dict:
-        """
-        Bind a Hivemind space to an explicit Graph Memory instance.
-
-        Validates the connection, creates the target memory when needed, and
-        stores the binding in the space.
-
-        Manual binding is only needed for a custom remote instance. Without an
-        explicit binding, the first non-empty ``long_push`` automatically binds
-        the configured embedded long-memory runtime.
-
-        Args:
-            space_id: Space to bind.
-            url: Graph Memory MCP endpoint.
-            token: Bearer token for the remote service.
-            memory_id: Target memory identifier.
-            ontology: Extraction ontology.
-
-        Returns:
-            Connection status and target-memory details.
+        """Operator tool: not advertised in tools/list. Canonical name: long_connect (also registered as graph_connect). Bind a space to an explicit Graph Memory instance; needed only for a custom remote instance, because without an explicit binding the first non-empty long_push automatically binds the configured embedded long-memory runtime. Requires permission write and access to space_id.
         """
         from ..auth.context import check_access, check_write_permission
         from ..core.engines import get_engine_registry
@@ -210,7 +249,15 @@ def register(mcp: MCPServer) -> int:
             # LongEngine ne la réplique pas).
             url_err = _validate_gm_url(url)
             if url_err:
-                return {"status": "error", "message": url_err}
+                return argument_refusal(
+                    url_err,
+                    kind=ErrorKind.INVALID_ARGUMENT,
+                    arguments=["url"],
+                    reason=(
+                        "url is a public http or https address of a Graph Memory "
+                        "server, for example 'https://graph.example.com/mcp'."
+                    ),
+                )
 
             # P3-7: graph_* est downstream-derived (ADR-0010) — JAMAIS un write
             # WriteSink, donc PAS de resolve_sink gate. LongEngine ne prend pas
@@ -231,49 +278,25 @@ def register(mcp: MCPServer) -> int:
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
     async def graph_push(
         space_id: Annotated[
-            str, Field(description="Space whose committed memory bank should be projected")
+            str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")
         ],
         include_volatile: Annotated[
             bool,
             Field(
                 default=False,
                 description=(
-                    "Also project volatile files such as activeContext.md and "
-                    "progress.md. They are skipped by default. Enabling this "
-                    "option requires manage permission and records an audit event."
+                    'true also projects activeContext.md and progress.md (requires permission manage and records an audit event); false skips them. Default: false'
                 ),
             ),
         ] = False,
     ) -> dict:
-        """
-        Project the committed memory bank into the long-term knowledge graph.
-
-        Existing mirrored files are replaced with their current content, new
-        files are ingested, and stale bank-mirror entries are removed. Canonical
-        documents identified by a stable ``source_path`` are never removed by
-        this bank projection.
-
-        For a non-empty bank, the tool uses an explicit Graph Memory binding
-        when one exists. Otherwise it automatically provisions and stores a
-        binding to the configured embedded long-memory runtime. An empty bank
-        returns without provisioning a binding.
-
-        ``activeContext.md``, ``progress.md``, and other configured volatile
-        basenames are skipped by default and reported in ``skipped_volatile``.
-        Set ``include_volatile=True`` only when those transient snapshots are
-        intentionally required; doing so requires manage permission and records
-        an audit event.
-
-        This operation is idempotent and re-runnable. It projects already
-        committed bank state and never authorizes, invalidates, or replaces a
-        Hivemind commit.
-
-        Args:
-            space_id: Space whose committed bank should be projected.
-            include_volatile: Whether to include configured volatile files.
-
-        Returns:
-            Projection counts, skipped volatile files, errors, and duration.
+        """Project the committed memory bank of a space into its long-term memory.
+        Canonical name: long_push (also registered as graph_push).
+        Use when: the user or an operator explicitly asks to refresh the long-term memory from the bank.
+        Do not use when: ending a work block (long_push is not routine session-end work) or ingesting repository documents (that is long_ingest, permission manage).
+        Before calling: permission write; access to space_id; a consolidation completed since the last push.
+        Peer tools: mid_consolidate (before), long_status (after), long_ingest (canonical documents).
+        Result: read the projection counts and skipped_volatile; activeContext.md and progress.md stay out unless a manager sets include_volatile.
         """
         from ..auth.context import (
             check_access,
@@ -317,27 +340,21 @@ def register(mcp: MCPServer) -> int:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def graph_status(
-        space_id: Annotated[str, Field(description="Space identifier")],
+        space_id: Annotated[str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")],
         include_graph: Annotated[
             bool,
             Field(
-                description="Include a bounded, sanitized graph view for the admin console"
+                description='true includes a bounded, sanitized graph view for the admin console; false returns the status only. Default: false'
             ),
         ] = False,
     ) -> dict:
-        """
-        Read a space's long-memory connection and projection status.
-
-        Tests Graph Memory connectivity and returns target-memory statistics,
-        including document, entity, and relation counts, plus the latest bank
-        projection metadata.
-
-        Args:
-            space_id: Space to inspect.
-            include_graph: Include a bounded sanitized graph view.
-
-        Returns:
-            Binding, connectivity, graph statistics, and projection status.
+        """Read the long-memory binding, connectivity and projection status of a space.
+        Canonical name: long_status (also registered as graph_status).
+        Use when: long_query returned nothing or an error and the agent must know whether the space has long memory.
+        Do not use when: the agent wants to push the bank into long memory; that is not routine work, an operator decides on long_push.
+        Before calling: permission read; access to space_id; no prior call.
+        Peer tools: long_query (before), long_push (operator decision).
+        Result: report the status to the user; do not bind, push or ingest as routine work.
         """
         from ..auth.context import check_access
         from ..core.engines import get_engine_registry
@@ -360,35 +377,19 @@ def register(mcp: MCPServer) -> int:
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
     async def graph_disconnect(
         space_id: Annotated[
-            str, Field(description="Space whose explicit Graph Memory binding should be removed")
+            str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")
         ],
         use_embedded: Annotated[
             bool,
             Field(
                 default=False,
                 description=(
-                    "Replace the explicit Graph Memory binding with the "
-                    "validated embedded long-memory runtime. Requires manage "
-                    "permission. No remote data is deleted or ingested."
+                    'true replaces the explicit binding with the validated embedded long-memory runtime (requires permission manage; no remote data is deleted or ingested); false only removes the binding. Default: false'
                 ),
             ),
         ] = False,
     ) -> dict:
-        """
-        Remove a space's explicit Graph Memory binding.
-
-        With ``use_embedded=True``, the tool provisions and validates the
-        embedded long-memory runtime before replacing the previous binding.
-        Existing remote graph data is never deleted by this operation.
-
-        Delete remote data separately through Graph Memory when required.
-
-        Args:
-            space_id: Space whose binding should be removed.
-            use_embedded: Replace the binding with the embedded runtime.
-
-        Returns:
-            Confirmation and the previous binding details.
+        """Operator tool: not advertised in tools/list. Canonical name: long_disconnect (also registered as graph_disconnect). Remove the explicit Graph Memory binding of a space; with use_embedded=true (permission manage) the validated embedded runtime replaces it. Remote graph data is never deleted. Requires permission write and access to space_id.
         """
         from ..auth.context import (
             check_access,
@@ -432,37 +433,27 @@ def register(mcp: MCPServer) -> int:
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def long_query(
         space_id: Annotated[
-            str, Field(description="Space identifier")
+            str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")
         ],
         query: Annotated[
             str,
             Field(
                 description=(
-                    "Semantic graph query using the configured embedding endpoint; "
-                    "no generative chat completion is performed"
+                    "Semantic query text, for example 'incident on the auth service'; the configured embedding endpoint embeds it and no generative chat completion is performed"
                 )
             ),
         ],
         limit: Annotated[
             int,
-            Field(default=10, description="Maximum number of results to return"),
+            Field(default=10, description='Maximum number of results, between 1 and 100. Default: 10'),
         ] = 10,
     ) -> dict:
-        """
-        Query a space's long-term knowledge graph (read-only).
-
-        Embeds the query through the configured embedding endpoint, then
-        searches the graph and vector projection. It performs no generative
-        chat completion. Long-term memory is a derived index and is never an
-        authority for Hivemind commit state.
-
-        Args:
-            space_id: Space to query.
-            query: Semantic search query.
-            limit: Maximum number of results.
-
-        Returns:
-            Graph and ontology query results.
+        """Query the long-term memory of a space: a derived, non-authoritative knowledge graph.
+        Use when: the agent needs historical context, prior incidents, runbooks, decisions or cross-document relationships.
+        Do not use when: the agent needs recent facts (call short_read or mid_read_all). Do not treat the results as the final authority; repository files win.
+        Before calling: permission read; access to space_id; no prior call.
+        Peer tools: short_search (recent notes), long_status (whether the space has long memory).
+        Result: re-read the referenced canonical file before acting; long memory is non-authoritative.
         """
         from ..auth.context import check_access
         from ..core.engines import get_engine_registry
@@ -489,15 +480,13 @@ def register(mcp: MCPServer) -> int:
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
     async def long_ingest(
         space_id: Annotated[
-            str, Field(description="Target space identifier")
+            str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")
         ],
         documents: Annotated[
             list[dict],
             Field(
                 description=(
-                    "Canonical documents keyed by a stable source_path rather "
-                    "than a mutable bank filename. Each document uses "
-                    "{source_path, content|content_base64, sha256?}."
+                    'List of canonical documents in the format {source_path, content or content_base64, sha256 (optional)}, for example [{"source_path": "docs/runbook.md", "content": "..."}]'
                 )
             ),
         ],
@@ -506,10 +495,7 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="dry-run",
                 description=(
-                    "Planning mode: 'dry-run' computes source_path and sha256 "
-                    "locally with no network access; 'check-remote' compares "
-                    "against the remote index without writing; 'apply' is not "
-                    "supported and returns applied=false with a reason."
+                    "Planning mode, one of 'dry-run' (computes source_path and sha256 locally without network access), 'check-remote' (compares against the remote index without writing) or 'apply' (not supported; returns applied=false). Default: 'dry-run'"
                 ),
             ),
         ] = "dry-run",
@@ -518,39 +504,17 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default=False,
                 description=(
-                    "Allow volatile documents such as activeContext.md and "
-                    "progress.md. They are rejected by default. Enabling this "
-                    "option requires manage permission and records an audit event."
+                    'true allows activeContext.md and progress.md (requires permission manage and records an audit event); false rejects them. Default: false'
                 ),
             ),
         ] = False,
     ) -> dict:
-        """
-        Plan canonical-document ingestion into long-term memory without writing.
-
-        Canonical documents use a stable ``source_path`` and optional SHA-256,
-        independently of the filename-keyed bank projection performed by
-        ``long_push``.
-
-        - ``dry-run`` computes ``{source_path, sha256}`` locally with no network
-          access.
-        - ``check-remote`` compares hashes through a read-only remote listing
-          and plans SKIP, UPDATE, or INGEST actions.
-        - ``apply`` is currently unsupported and returns ``applied: false``
-          without performing a write.
-
-        Configured volatile basenames are rejected in every mode by default.
-        ``include_volatile=True`` requires manage permission and records an
-        audit event only after authorization succeeds.
-
-        Args:
-            space_id: Target space.
-            documents: Canonical documents keyed by ``source_path``.
-            mode: ``dry-run`` (default), ``check-remote``, or ``apply``.
-            include_volatile: Allow configured volatile basenames.
-
-        Returns:
-            An ingestion plan, or an explicit unsupported result for ``apply``.
+        """Plan the ingestion of canonical repository documents into the long-term memory of a space, without writing.
+        Use when: an operator prepares canonical documents (stable source_path) for long memory and wants a plan (mode dry-run or check-remote).
+        Do not use when: the bank should be projected (call long_push). Do not use it as routine session-end work.
+        Before calling: permission manage; access to space_id; no prior call.
+        Peer tools: long_push (bank projection), long_status (after).
+        Result: read the planned actions; mode apply is not supported and returns applied=false.
         """
         from ..auth.context import (
             check_access,
@@ -578,17 +542,16 @@ def register(mcp: MCPServer) -> int:
             )
             if offending:
                 if not include_volatile:
-                    return {
-                        "status": "error",
-                        "message": (
+                    return _volatile_refusal(
+                        (
                             "Volatile files (activeContext.md / progress.md) are "
                             "REJECTED from canonical long-tier ingestion by "
                             "default. These files are continuously rewritten; "
                             "use include_volatile=True (the 'manage' permission "
                             "is required) to force their admission."
                         ),
-                        "rejected_volatile": offending,
-                    }
+                        offending,
+                    )
                 # Opt-in : la permission 'manage' est requise. La garde précède
                 # l'audit (un refus n'audite JAMAIS).
                 manage_err = check_manage_permission()
@@ -611,24 +574,12 @@ def register(mcp: MCPServer) -> int:
             str,
             Field(
                 description=(
-                    "Space whose embedded long-memory embedding projection "
-                    "should be rebuilt in explicit maintenance mode"
+                    "Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'"
                 )
             ),
         ],
     ) -> dict:
-        """Rebuild a space's embedded long-memory embedding projection.
-
-        This hidden operator operation is synchronous, non-idempotent, and
-        supported only for an already-persisted embedded runtime binding. It
-        never provisions a binding and never operates on a custom remote
-        binding.
-
-        Args:
-            space_id: Space whose derived embedding projection should be rebuilt.
-
-        Returns:
-            The bounded maintenance result returned by the embedded runtime.
+        """Operator tool: not advertised in tools/list. Rebuild the embedded long-memory embedding projection of a space; synchronous, not idempotent, and only for a persisted embedded binding. Requires permission manage and access to space_id.
         """
         from ..auth.context import check_access, check_manage_permission
         from ..core.engines import get_engine_registry
@@ -660,16 +611,10 @@ def register(mcp: MCPServer) -> int:
     async def ontology_list(
         space_id: Annotated[
             str,
-            Field(description="Space identifier"),
+            Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'"),
         ],
     ) -> dict:
-        """List ontologies available in Graph Memory for a space.
-
-        Args:
-            space_id: Target space identifier.
-
-        Returns:
-            Dictionary containing the list of available ontologies.
+        """Operator tool: not advertised in tools/list. List the ontologies available in Graph Memory for a space. Requires permission read and access to space_id.
         """
         from ..auth.context import check_access, safe_error
         from ..core.engines import get_engine_registry
@@ -686,21 +631,14 @@ def register(mcp: MCPServer) -> int:
     async def ontology_get(
         space_id: Annotated[
             str,
-            Field(description="Space identifier"),
+            Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'"),
         ],
         name: Annotated[
             str,
-            Field(description="Ontology name"),
+            Field(description="Ontology name, for example 'general'"),
         ],
     ) -> dict:
-        """Get an ontology definition by name.
-
-        Args:
-            space_id: Target space identifier.
-            name: Name of the ontology to retrieve.
-
-        Returns:
-            Dictionary containing the ontology definition and YAML content.
+        """Operator tool: not advertised in tools/list. Read one ontology definition by name, with its YAML content. Requires permission read and access to space_id.
         """
         from ..auth.context import check_access, safe_error
         from ..core.engines import get_engine_registry
@@ -717,21 +655,14 @@ def register(mcp: MCPServer) -> int:
     async def ontology_validate(
         space_id: Annotated[
             str,
-            Field(description="Space identifier"),
+            Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'"),
         ],
         content_yaml: Annotated[
             str,
-            Field(description="Ontology YAML content to validate"),
+            Field(description='Ontology definition in YAML format, for example the content returned by ontology_get'),
         ],
     ) -> dict:
-        """Validate an ontology YAML definition without mutating state.
-
-        Args:
-            space_id: Target space identifier.
-            content_yaml: Raw YAML string of the ontology definition.
-
-        Returns:
-            Validation result with status, validity flag and errors if any.
+        """Operator tool: not advertised in tools/list. Validate an ontology YAML definition without changing any state. Requires permission read and access to space_id.
         """
         from ..auth.context import check_access, safe_error
         from ..core.engines import get_engine_registry
@@ -795,43 +726,26 @@ def register(mcp: MCPServer) -> int:
     async def long_ingest_async(
         space_id: Annotated[
             str,
-            Field(description="Space identifier"),
+            Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'"),
         ],
         documents: Annotated[
             list[dict],
-            Field(description="Batch of documents to ingest asynchronously"),
+            Field(description='List of documents in the format {filename, source_path, content_base64, sha256, metadata (optional), source_modified_at (optional, ISO 8601)}; the checksum is the hexadecimal sha256 of the decoded bytes'),
         ],
         options: Annotated[
             Optional[dict],
-            Field(description="Optional ingestion options (e.g. replace_existing)"),
+            Field(description="Ingestion options in the format {replace_existing: true|false, ontology: a registered name, a YAML definition or 'auto'}. Default: null, which uses the current memory default"),
         ] = None,
         include_volatile: Annotated[
             bool,
             Field(
                 description=(
-                    "Allow volatile documents such as activeContext.md and "
-                    "progress.md. They are rejected by default. Enabling this "
-                    "option requires manage permission and records an audit event."
+                    'true allows activeContext.md and progress.md (requires permission manage and records an audit event); false rejects them. Default: false'
                 ),
             ),
         ] = False,
     ) -> dict:
-        """Queue a batch of documents for asynchronous ingestion into long-term memory.
-
-        Args:
-            space_id: Target space identifier.
-            documents: Each dict requires filename, a stable source_path,
-                content_base64, and a hexadecimal sha256 of the decoded bytes.
-                Optional fields are metadata and source_modified_at (ISO 8601).
-                This async path does not convert plain content and
-                does not compute a missing checksum for the caller.
-            options: replace_existing: bool; ontology: registered name/YAML, or
-                "auto" to construct a shared catalogue from the complete initial
-                batch in an empty memory. Omission uses the current memory default.
-            include_volatile: Allow configured volatile basenames.
-
-        Returns:
-            Batch submission result with batch_id and list of queued job details.
+        """Operator tool: not advertised in tools/list. Queue a batch of canonical documents for asynchronous ingestion into the long-term memory of a space; each document carries filename, source_path, content_base64 and the sha256 of the decoded bytes; this path does not convert plain content and does not compute a missing checksum for the caller. Requires permission manage and access to space_id. Follow a job with long_ingest_status.
         """
         from ..auth.context import (
             check_access,
@@ -852,10 +766,16 @@ def register(mcp: MCPServer) -> int:
                 return manage_err
 
             if not isinstance(documents, list) or not documents:
-                return {
-                    "status": "error",
-                    "message": "documents must be a non-empty list",
-                }
+                return argument_refusal(
+                    "documents must be a non-empty list",
+                    kind=ErrorKind.MISSING_ARGUMENT,
+                    arguments=["documents"],
+                    reason=(
+                        "documents is a list of at least one object with "
+                        "source_path and content, for example "
+                        "[{\"source_path\": \"docs/runbook.md\", \"content\": \"...\"}]."
+                    ),
+                )
 
             volatile = set(get_settings().graph_push_volatile_files)
             offending = sorted(
@@ -867,16 +787,15 @@ def register(mcp: MCPServer) -> int:
             )
             if offending:
                 if not include_volatile:
-                    return {
-                        "status": "error",
-                        "message": (
+                    return _volatile_refusal(
+                        (
                             "Volatile files (activeContext.md / progress.md) are "
                             "REJECTED from canonical long-tier ingestion by "
                             "default. Use include_volatile=True (the 'manage' permission "
                             "is required) to force their admission."
                         ),
-                        "rejected_volatile": offending,
-                    }
+                        offending,
+                    )
                 manage_err = check_manage_permission()
                 if manage_err:
                     return manage_err
@@ -895,26 +814,18 @@ def register(mcp: MCPServer) -> int:
     async def long_ingest_status(
         space_id: Annotated[
             str,
-            Field(description="Space identifier"),
+            Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'"),
         ],
         job_id: Annotated[
             str,
-            Field(description="Ingestion job identifier"),
+            Field(description="Ingestion job identifier returned by long_ingest_async, for example 'ingest_1a2b3c'"),
         ],
         archive: Annotated[
             bool,
-            Field(description="Read a job in the pinned MID archive instead of the primary memory"),
+            Field(description='true reads a job of the pinned mid-memory archive; false reads the primary long memory. Default: false'),
         ] = False,
     ) -> dict:
-        """Return the status and progress of an asynchronous ingestion job.
-
-        Args:
-            space_id: Target space identifier.
-            job_id: Job identifier returned by long_ingest_async.
-            archive: Select the pinned MID archive, as with long_ingest_list.
-
-        Returns:
-            Job status dictionary with progress, step, entity/relation counts and error if any.
+        """Operator tool: not advertised in tools/list. Read the status and progress of one asynchronous ingestion job. Requires permission read and access to space_id.
         """
         from ..auth.context import check_access, safe_error
         from ..core.engines import get_engine_registry
@@ -925,13 +836,15 @@ def register(mcp: MCPServer) -> int:
                 return access_err
 
             if not isinstance(job_id, str) or not job_id.strip():
-                return {
-                    "status": "error",
-                    "message": "job_id must be a non-empty string",
-                }
+                return _job_id_refusal()
 
             if type(archive) is not bool:
-                return {"status": "error", "message": "archive must be a boolean"}
+                return argument_refusal(
+                    "archive must be a boolean",
+                    kind=ErrorKind.INVALID_ARGUMENT,
+                    arguments=["archive"],
+                    reason="archive is true or false, for example false.",
+                )
 
             engine = get_engine_registry().long_engine()
             read_status = engine.archive_ingest_status if archive else engine.ingest_status
@@ -946,41 +859,30 @@ def register(mcp: MCPServer) -> int:
     async def long_ingest_list(
         space_id: Annotated[
             str,
-            Field(description="Space identifier"),
+            Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'"),
         ],
         batch_id: Annotated[
             Optional[str],
-            Field(description="Optional batch ID filter"),
+            Field(description="Batch identifier filter, for example 'batch_1a2b3c'. Default: null, no filter"),
         ] = None,
         status: Annotated[
             Optional[str],
-            Field(description="Optional job status filter (e.g. queued, running, succeeded, failed)"),
+            Field(description='Job status filter, one of queued|running|succeeded|failed. Default: null, no filter'),
         ] = None,
         limit: Annotated[
             int,
-            Field(description="Maximum number of jobs to return (1-100)"),
+            Field(description='Maximum number of jobs to return, between 1 and 100. Default: 50'),
         ] = 50,
         offset: Annotated[
             int,
-            Field(description="Number of jobs to skip"),
+            Field(description='Number of jobs to skip, 0 or more. Default: 0'),
         ] = 0,
         archive: Annotated[
             bool,
-            Field(description="List jobs in the pinned MID-capture archive instead of the primary LONG memory"),
+            Field(description='true lists the jobs of the pinned mid-memory archive; false lists the primary long memory. Default: false'),
         ] = False,
     ) -> dict:
-        """List asynchronous ingestion jobs for a space.
-
-        Args:
-            space_id: Target space identifier.
-            batch_id: Optional filter by batch ID.
-            status: Optional filter by status.
-            limit: Maximum items to return.
-            offset: Items offset.
-            archive: Read the pinned MID-capture archive job queue.
-
-        Returns:
-            List of job status dictionaries and pagination metadata.
+        """Operator tool: not advertised in tools/list. List the asynchronous ingestion jobs of a space with pagination and filters. Requires permission read and access to space_id.
         """
         from ..auth.context import check_access, safe_error
         from ..core.engines import get_engine_registry
@@ -991,15 +893,9 @@ def register(mcp: MCPServer) -> int:
                 return access_err
 
             if type(limit) is not int or limit < 1 or limit > 100:
-                return {
-                    "status": "error",
-                    "message": "limit must be an integer between 1 and 100",
-                }
+                return _limit_refusal()
             if type(offset) is not int or offset < 0:
-                return {
-                    "status": "error",
-                    "message": "offset must be a non-negative integer",
-                }
+                return _offset_refusal()
             arguments = dict(space_id=space_id, batch_id=batch_id, status=status,
                              limit=limit, offset=offset)
             if archive:
@@ -1012,21 +908,14 @@ def register(mcp: MCPServer) -> int:
     async def long_ingest_cancel(
         space_id: Annotated[
             str,
-            Field(description="Space identifier"),
+            Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'"),
         ],
         job_id: Annotated[
             str,
-            Field(description="Ingestion job identifier to cancel"),
+            Field(description="Ingestion job identifier to cancel, for example 'ingest_1a2b3c'"),
         ],
     ) -> dict:
-        """Request cooperative cancellation of an asynchronous ingestion job.
-
-        Args:
-            space_id: Target space identifier.
-            job_id: Job identifier to cancel.
-
-        Returns:
-            Cancellation acknowledgment result.
+        """Operator tool: not advertised in tools/list. Request the cooperative cancellation of an asynchronous ingestion job. Requires permission write and access to space_id.
         """
         from ..auth.context import check_access, check_write_permission, safe_error
         from ..core.engines import get_engine_registry
@@ -1041,10 +930,7 @@ def register(mcp: MCPServer) -> int:
                 return write_err
 
             if not isinstance(job_id, str) or not job_id.strip():
-                return {
-                    "status": "error",
-                    "message": "job_id must be a non-empty string",
-                }
+                return _job_id_refusal()
 
             return await get_engine_registry().long_engine().ingest_cancel(
                 space_id=space_id,
@@ -1057,36 +943,26 @@ def register(mcp: MCPServer) -> int:
     async def long_document_list(
         space_id: Annotated[
             str,
-            Field(description="Space identifier"),
+            Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'"),
         ],
         limit: Annotated[
             int,
-            Field(description="Maximum number of documents to return (1-100)"),
+            Field(description='Maximum number of documents to return, between 1 and 100. Default: 50'),
         ] = 50,
         offset: Annotated[
             int,
-            Field(description="Number of documents to skip"),
+            Field(description='Number of documents to skip, 0 or more. Default: 0'),
         ] = 0,
         status: Annotated[
             Optional[str],
-            Field(description="Optional filter by ingestion status (e.g. succeeded, failed)"),
+            Field(description='Ingestion status filter, one of succeeded|failed. Default: null, no filter'),
         ] = None,
         query: Annotated[
             Optional[str],
-            Field(description="Optional search filter on filename or source_path"),
+            Field(description="Search text matched against filename or source_path, for example 'runbook'. Default: null, no filter"),
         ] = None,
     ) -> dict:
-        """List indexed documents in long memory for a space with pagination and filters.
-
-        Args:
-            space_id: Target space identifier.
-            limit: Maximum items to return (1-100).
-            offset: Items offset.
-            status: Optional filter by status.
-            query: Optional search filter.
-
-        Returns:
-            Dictionary with total_count, pagination, and documents list.
+        """Operator tool: not advertised in tools/list. List the documents indexed in the long-term memory of a space with pagination and filters. Requires permission read and access to space_id.
         """
         from ..auth.context import check_access, safe_error
         from ..core.engines import get_engine_registry
@@ -1097,15 +973,9 @@ def register(mcp: MCPServer) -> int:
                 return access_err
 
             if type(limit) is not int or limit < 1 or limit > 100:
-                return {
-                    "status": "error",
-                    "message": "limit must be an integer between 1 and 100",
-                }
+                return _limit_refusal()
             if type(offset) is not int or offset < 0:
-                return {
-                    "status": "error",
-                    "message": "offset must be a non-negative integer",
-                }
+                return _offset_refusal()
 
             return await get_engine_registry().long_engine().list_documents(
                 space_id=space_id,
@@ -1121,31 +991,22 @@ def register(mcp: MCPServer) -> int:
     async def long_document_get(
         space_id: Annotated[
             str,
-            Field(description="Space identifier"),
+            Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'"),
         ],
         document_id: Annotated[
             Optional[str],
-            Field(description="Internal document identifier (UUID)"),
+            Field(description="Internal document identifier in UUID format, for example '2f1c7b0e-9d4a-4c1b-8f3e-5a6d7c8e9f00'. Default: null"),
         ] = None,
         source_path: Annotated[
             Optional[str],
-            Field(description="Stable canonical source path of the document"),
+            Field(description="Stable canonical source path of the document, for example 'docs/runbook.md'. Default: null"),
         ] = None,
         include_content: Annotated[
             bool,
-            Field(description="Download and include S3 content; default False"),
+            Field(description='true downloads and includes the content; false returns the metadata only. Default: false'),
         ] = False,
     ) -> dict:
-        """Get indexed document metadata and optional content by document_id or source_path.
-
-        Args:
-            space_id: Target space identifier.
-            document_id: Optional internal document UUID.
-            source_path: Optional canonical source path.
-            include_content: Download content if True.
-
-        Returns:
-            Document metadata dictionary and content if requested.
+        """Operator tool: not advertised in tools/list. Read the metadata and, on request, the content of one indexed document by document_id or source_path. Requires permission read and access to space_id.
         """
         from ..auth.context import check_access, safe_error
         from ..core.engines import get_engine_registry
@@ -1156,27 +1017,39 @@ def register(mcp: MCPServer) -> int:
                 return access_err
 
             if type(include_content) is not bool:
-                return {
-                    "status": "error",
-                    "message": f"'include_content' must be a boolean (True/False), got {type(include_content).__name__}: {include_content!r}",
-                }
+                return argument_refusal(
+                    f"'include_content' must be a boolean (True/False), got {type(include_content).__name__}: {include_content!r}",
+                    kind=ErrorKind.INVALID_ARGUMENT,
+                    arguments=["include_content"],
+                    reason="include_content is true or false, for example false.",
+                )
 
             if not document_id and not source_path:
-                return {
-                    "status": "error",
-                    "message": "At least one of 'document_id' or 'source_path' must be provided",
-                }
+                return argument_refusal(
+                    "At least one of 'document_id' or 'source_path' must be provided",
+                    kind=ErrorKind.MISSING_ARGUMENT,
+                    arguments=["document_id", "source_path"],
+                    reason=(
+                        "Pass document_id (an identifier from long_document_list) "
+                        "or source_path (a repository path, for example "
+                        "'docs/runbook.md')."
+                    ),
+                )
 
             if document_id is not None and (not isinstance(document_id, str) or not document_id.strip()):
-                return {
-                    "status": "error",
-                    "message": "'document_id' must be a non-empty string when provided",
-                }
+                return argument_refusal(
+                    "'document_id' must be a non-empty string when provided",
+                    kind=ErrorKind.INVALID_ARGUMENT,
+                    arguments=["document_id"],
+                    reason="document_id is a non-empty identifier from long_document_list.",
+                )
             if source_path is not None and (not isinstance(source_path, str) or not source_path.strip()):
-                return {
-                    "status": "error",
-                    "message": "'source_path' must be a non-empty string when provided",
-                }
+                return argument_refusal(
+                    "'source_path' must be a non-empty string when provided",
+                    kind=ErrorKind.INVALID_ARGUMENT,
+                    arguments=["source_path"],
+                    reason="source_path is a non-empty repository path, for example 'docs/runbook.md'.",
+                )
 
             return await get_engine_registry().long_engine().get_document(
                 space_id=space_id,

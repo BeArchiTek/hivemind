@@ -33,12 +33,22 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from mcp.server.mcpserver import MCPServer
+
+from ..auth.context import authentication_required
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
 
 _LIVE_NOTE_TS_RE = re.compile(r"^(\d{8}T\d{6})_")
 _logger = logging.getLogger("live_mem.tools.bank")
+
+
+# error_kind per bank_compact failure_reason (specification 001, FR-003, FR-008).
+_COMPACT_FAILURE_KINDS = {
+    "direct_local_route_required": "write_route_refused",
+    "hivemind_state_corrupt": "write_route_refused",
+    "compaction_tool_failure": "internal_failure",
+}
 
 
 def _safe_bank_compact_failure(
@@ -68,7 +78,9 @@ def _safe_bank_compact_failure(
         "failed_phase": "prepare",
         "rollback_outcome": "not_needed",
         "failures": [{"filename": "", "error": failure_reason}],
-        "remediation": remediation,
+        "error_kind": _COMPACT_FAILURE_KINDS.get(failure_reason, "internal_failure"),
+        # The former top-level string is the reason of the remediation object.
+        "remediation": {"reason": remediation, "retryable": False},
     }
     if mutation_path_entered:
         result.update(
@@ -121,26 +133,44 @@ def _validate_bank_filename(filename: str) -> dict | None:
 
     Retourne None si OK, sinon un dict d'erreur prêt à être renvoyé.
     """
+    from .guidance import ErrorKind, argument_refusal
+
+    reason = (
+        "filename is a relative Markdown path without '..', without a leading "
+        "'/' and without < > \" ' \\ or control characters, for example "
+        "'activeContext.md'."
+    )
     if not filename or not filename.strip():
-        return {"status": "error", "message": "Filename is required"}
+        return argument_refusal(
+            "Filename is required",
+            kind=ErrorKind.MISSING_ARGUMENT,
+            arguments=["filename"],
+            reason=reason,
+        )
     if ".." in filename:
-        return {
-            "status": "error",
-            "message": "Invalid filename: '..' is not allowed",
-        }
+        return argument_refusal(
+            "Invalid filename: '..' is not allowed",
+            kind=ErrorKind.INVALID_ARGUMENT,
+            arguments=["filename"],
+            reason=reason,
+        )
     if filename.startswith("/"):
-        return {
-            "status": "error",
-            "message": "Invalid filename: it cannot start with '/'",
-        }
+        return argument_refusal(
+            "Invalid filename: it cannot start with '/'",
+            kind=ErrorKind.INVALID_ARGUMENT,
+            arguments=["filename"],
+            reason=reason,
+        )
     if _BANK_FILENAME_DANGEROUS.search(filename):
-        return {
-            "status": "error",
-            "message": (
+        return argument_refusal(
+            (
                 "The filename contains unsafe characters "
                 "(< > \" ' \\ or control characters are not allowed)"
             ),
-        }
+            kind=ErrorKind.INVALID_ARGUMENT,
+            arguments=["filename"],
+            reason=reason,
+        )
     return None
 
 
@@ -157,7 +187,7 @@ def register(mcp: MCPServer) -> int:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def bank_read(
-        space_id: Annotated[str, Field(description="Space identifier")],
+        space_id: Annotated[str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")],
         filename: Annotated[
             str,
             Field(
@@ -165,21 +195,13 @@ def register(mcp: MCPServer) -> int:
             ),
         ],
     ) -> dict:
-        """
-        Read one file from a space's memory bank.
-
-        Bank files are Markdown documents created and maintained by the
-        consolidator.
-
-        If the direct object key is absent, the tool also compares normalized
-        filenames to recover names containing invisible Unicode characters.
-
-        Args:
-            space_id: Space to read.
-            filename: Bank filename, for example ``activeContext.md``.
-
-        Returns:
-            File content, size, and modification time.
+        """Read one memory-bank file of a space.
+        Canonical name: mid_read (also registered as bank_read).
+        Use when: the agent needs one bank file again, for example activeContext.md after a consolidation completed.
+        Do not use when: the agent starts a task (call mid_read_all, which returns every file) or just called mid_consolidate (the job runs later; do not read expecting its result).
+        Before calling: permission read; access to space_id; mid_list when the filename is unknown.
+        Peer tools: mid_list (before), mid_read_all (every file), short_note (during work).
+        Result: read the file as consolidated context; repository files win over it.
         """
         from ..auth.context import check_access
         from ..core.storage import get_storage
@@ -243,19 +265,15 @@ def register(mcp: MCPServer) -> int:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def bank_read_all(
-        space_id: Annotated[str, Field(description="Space identifier")],
+        space_id: Annotated[str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")],
     ) -> dict:
-        """
-        Read every file in a space's memory bank in one request.
-
-        Use this at session startup when an agent needs the complete compact
-        context rather than selected files.
-
-        Args:
-            space_id: Space to read.
-
-        Returns:
-            All bank files with their content and aggregate size.
+        """Read every memory-bank file of a space in one request.
+        Canonical name: mid_read_all (also registered as bank_read_all).
+        Use when: at the start of every task, as the second start-of-task call, to load the compact project context.
+        Do not use when: the agent needs one file (call mid_read) or just called mid_consolidate (the job runs later; do not read expecting its result).
+        Before calling: permission read; access to space_id; space_rules first.
+        Peer tools: space_rules (before), short_read (after), space_summary (the three in one call).
+        Result: identify the current focus from the files; if the call fails, stop before any mutation.
         """
         from ..auth.context import check_access
         from ..core.storage import get_storage
@@ -303,18 +321,15 @@ def register(mcp: MCPServer) -> int:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def bank_list(
-        space_id: Annotated[str, Field(description="Space identifier")],
+        space_id: Annotated[str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")],
     ) -> dict:
-        """
-        List memory-bank files without returning their content.
-
-        Use this to inspect the bank structure before reading selected files.
-
-        Args:
-            space_id: Space whose bank should be listed.
-
-        Returns:
-            Filenames, sizes, and modification times.
+        """List the memory-bank files of a space without their content.
+        Canonical name: mid_list (also registered as bank_list).
+        Use when: the agent wants to know which bank files exist before reading some of them.
+        Do not use when: the agent needs the content (call mid_read for one file or mid_read_all for every file).
+        Before calling: permission read; access to space_id; no prior call.
+        Peer tools: mid_read and mid_read_all (after).
+        Result: choose the filename to pass to mid_read.
         """
         from ..auth.context import check_access
         from ..core.storage import get_storage, inventory_object_size
@@ -360,41 +375,25 @@ def register(mcp: MCPServer) -> int:
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=False))
     async def bank_consolidate(
         space_id: Annotated[
-            str, Field(description="Space whose notes should be consolidated")
+            str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")
         ],
         agent: Annotated[
             str | None,
             Field(
                 default=None,
                 description=(
-                    "Agent whose notes should be consolidated. Omit or pass "
-                    "null for the caller; pass an explicit empty string for "
-                    "all agents (manage or admin permission required)."
+                    "Agent whose notes are consolidated. Default: omitted or null, which selects the caller's own notes; an explicit empty string selects every agent and requires permission manage or admin; another agent's name, for example 'agent-cline', requires permission manage"
                 ),
             ),
         ] = None,
     ) -> dict:
-        """
-        Queue an asynchronous consolidation of short-term notes into the bank.
-
-        The queue is process-local and best-effort: queued jobs do not survive
-        a server restart. One consolidation runs at a time per space, while
-        different spaces may run in parallel.
-
-        The job reads the rules, residual summary, selected notes, and current
-        bank; asks the configured model to consolidate them; stores the updated
-        bank; removes processed notes; and updates the residual summary.
-
-        Args:
-            space_id: Space to consolidate.
-            agent: Omit or pass ``None`` for the caller's notes. An explicit
-                empty string selects every agent and requires manage or admin
-                permission. Selecting another agent also requires manage.
-
-        Returns:
-            A running or queued acknowledgement with a job identifier. Return
-            control to the user; query ``bank_consolidation_status`` only when
-            the user explicitly asks for status.
+        """Queue one asynchronous consolidation of the short-term notes of a space into its memory bank.
+        Canonical name: mid_consolidate (also registered as bank_consolidate).
+        Use when: at the end of a meaningful work block, after user validation, at most once per work block, after one summary short_note.
+        Do not use when: a job for the space is already queued or running (the response says so with existing_job), or the user has not validated the work. Consolidating another agent's notes needs permission manage.
+        Before calling: permission write; access to space_id; short_note entries exist; the user validated the work block.
+        Peer tools: short_note (before), bank_consolidation_status (only on an explicit user request).
+        Result: the job runs later: return to the user without polling, and do not read the bank expecting the result; existing_job means a job already existed and no second job was queued.
         """
         from ..auth.context import (
             check_access,
@@ -440,13 +439,12 @@ def register(mcp: MCPServer) -> int:
             token_info = get_effective_token_info()
             caller = token_info.get("client_name") if token_info else None
             if not isinstance(caller, str) or caller == "":
-                return {
-                    "status": "error",
-                    "message": (
-                        "A non-empty client_name identity is required to "
-                        "consolidate notes"
-                    ),
-                }
+                from ..auth.context import client_name_missing
+
+                return client_name_missing(
+                    "A non-empty client_name identity is required to "
+                    "consolidate notes"
+                )
 
             if agent is None:
                 # Défaut sûr identique pour write/manage/admin : mes notes.
@@ -459,15 +457,20 @@ def register(mcp: MCPServer) -> int:
             elif agent != caller:
                 manage_err = check_manage_permission()
                 if manage_err:
-                    return {
-                        "status": "error",
-                        "message": (
+                    from .guidance import refusal
+
+                    return refusal(
+                        (
                             f"The 'manage' permission is required to consolidate "
                             f"agent '{agent}' notes. "
                             f"You can consolidate your own notes by omitting "
                             f"agent or by using agent='{caller}'."
                         ),
-                    }
+                        manage_err["error_kind"],
+                        required_permission=manage_err["required_permission"],
+                        current_permissions=manage_err["current_permissions"],
+                        remediation=manage_err["remediation"],
+                    )
 
             # P3-7 ROUTE-FIRST GATE (fail-closed-routing mandatory correction):
             # bank_consolidate enqueues a job whose BACKGROUND WORKER performs
@@ -515,17 +518,15 @@ def register(mcp: MCPServer) -> int:
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def bank_consolidation_status(
         job_id: Annotated[
-            str, Field(description="Consolidation job identifier")
+            str, Field(description="Consolidation job identifier returned by mid_consolidate, for example 'consol_1a2b3c'")
         ],
     ) -> dict:
-        """
-        Read a process-local consolidation or observed manual compaction job.
-
-        Args:
-            job_id: Identifier from ``mid_consolidate`` or a queue summary.
-
-        Returns:
-            Job status and, when complete, its result or error.
+        """Read one consolidation or manual compaction job by its identifier.
+        Use when: the user explicitly asks for the status of a job returned by mid_consolidate.
+        Do not use when: the agent just called mid_consolidate (return to the user without polling) or needs every job of a space (call bank_consolidation_queues).
+        Before calling: permission read; access to the job's space; mid_consolidate returned the job_id.
+        Peer tools: mid_consolidate (before), bank_consolidation_queues (every job of a space).
+        Result: report the status and, when complete, the result or error to the user; do not call it in a loop.
         """
         from ..auth.context import check_access
         from ..core.consolidation_queue import get_consolidation_queue
@@ -552,25 +553,17 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "Optional comma-separated space identifiers. Empty selects "
-                    "all spaces accessible to the current credential."
+                    "Comma-separated space identifiers, for example 'project-alpha,project-beta'. Default: empty, which selects every space accessible to the token"
                 ),
             ),
         ] = "",
     ) -> dict:
-        """
-        Summarize consolidation activity by space.
-
-        Each space has an independent FIFO queue and at most one running job.
-        Different spaces may consolidate in parallel. Manage and admin callers
-        can inspect all-agent work; other callers remain agent-scoped.
-
-        Args:
-            space_ids: Optional comma-separated target list. Empty selects all
-                accessible spaces.
-
-        Returns:
-            Per-space queues and aggregate activity counts.
+        """Summarize the consolidation queue of each accessible space: the running job and the queued jobs.
+        Use when: the user explicitly asks what consolidation work is queued or running.
+        Do not use when: the agent waits for its own job (return to the user without polling) or needs one job (call bank_consolidation_status with the job_id).
+        Before calling: permission read; access to each space in space_ids (empty selects every accessible space); no prior call.
+        Peer tools: mid_consolidate (creates the jobs), bank_consolidation_status (one job).
+        Result: report the queues to the user; do not submit a second consolidation for a space that has one.
         """
         from ..auth.context import _get_effective_token_info, check_access
         from ..config import get_settings
@@ -580,7 +573,7 @@ def register(mcp: MCPServer) -> int:
         try:
             token_info = _get_effective_token_info()
             if token_info is None:
-                return {"status": "error", "message": "Authentication required"}
+                return authentication_required()
 
             requested_ids = [
                 sid.strip() for sid in space_ids.split(",") if sid.strip()
@@ -656,8 +649,7 @@ def register(mcp: MCPServer) -> int:
                 default=5,
                 ge=1,
                 description=(
-                    "Minimum unconsolidated note count for a space to be "
-                    "considered stale (default: 5)."
+                    'Minimum number of unconsolidated notes for a space to be stale, at least 1. Default: 5'
                 ),
             ),
         ] = 5,
@@ -667,8 +659,7 @@ def register(mcp: MCPServer) -> int:
                 default=5,
                 ge=0,
                 description=(
-                    "Minimum age in days of the oldest note for a space to be "
-                    "considered stale (default: 5)."
+                    'Minimum age in days of the oldest note for a space to be stale, 0 or more. Default: 5'
                 ),
             ),
         ] = 5,
@@ -677,30 +668,17 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default="",
                 description=(
-                    "Optional comma-separated space identifiers. Empty selects "
-                    "all spaces accessible to the current credential."
+                    "Comma-separated space identifiers, for example 'project-alpha,project-beta'. Default: empty, which selects every space accessible to the token"
                 ),
             ),
         ] = "",
     ) -> dict:
-        """
-        Find spaces whose note consolidation is stale.
-
-        For each accessible space, counts unconsolidated short-term notes and
-        calculates the age of the oldest note. A space is stale only when both
-        ``live_notes_count >= min_notes`` and
-        ``oldest_note_age_days >= min_age_days``.
-
-        This read-only tool helps operators find spaces accumulating context
-        before deciding whether to trigger consolidation.
-
-        Args:
-            min_notes: Minimum unconsolidated note count.
-            min_age_days: Minimum age of the oldest note, in days.
-            space_ids: Optional comma-separated target list.
-
-        Returns:
-            Stale spaces, aggregate metrics, and inaccessible targets.
+        """Find the spaces whose unconsolidated notes are old enough to consolidate.
+        Use when: the user or an operator asks which spaces accumulate notes without consolidation.
+        Do not use when: the agent works in one known space; it decides from its own work block when to call mid_consolidate.
+        Before calling: permission read; access to each space in space_ids (empty selects every accessible space); no prior call.
+        Peer tools: mid_consolidate (after, at most once per stale space and after user validation), bank_consolidation_queues.
+        Result: report the stale spaces to the user; consolidate only after user validation.
         """
         from ..auth.context import _get_effective_token_info, check_access
         from ..core.space import get_space_service
@@ -709,7 +687,7 @@ def register(mcp: MCPServer) -> int:
         try:
             token_info = _get_effective_token_info()
             if token_info is None:
-                return {"status": "error", "message": "Authentication required"}
+                return authentication_required()
 
             requested_ids = [
                 sid.strip() for sid in space_ids.split(",") if sid.strip()
@@ -820,47 +798,21 @@ def register(mcp: MCPServer) -> int:
             return safe_error(e, "bank")
 
     @mcp.tool(
-        description="Scan for or repair malformed Memory Bank paths and duplicates.",
         annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True),
     )
     async def bank_repair(
         space_id: Annotated[
-            str, Field(description="Identifier of the space to repair")
+            str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")
         ],
         dry_run: Annotated[
             bool,
             Field(
                 default=True,
-                description="True = scan only (list files to repair); False = apply the repairs",
+                description='true scans only and lists the files to repair; false applies the repairs. Default: true',
             ),
         ] = True,
     ) -> dict:
-        """
-        Répare les fichiers bank : caractères Unicode invisibles,
-        préfixes parasites (1.MEMORY_BANK/) et doublons multi-chemins.
-
-        Détecte 3 types de problèmes :
-        1. Caractères Unicode invisibles dans les noms de fichiers
-        2. Préfixes parasites (1.MEMORY_BANK/, MEMORY_BANK/, bank/)
-        3. Doublons : même fichier sanitisé à des chemins S3 différents
-
-        Pour chaque fichier, extrait le chemin relatif complet,
-        le sanitise, et si le chemin canonique diffère :
-        - Écrit le contenu sous le chemin canonique
-        - Supprime l'ancien fichier
-
-        Si un doublon existe (même nom sanitisé, plusieurs clés S3),
-        garde la version la plus récente et supprime les autres.
-
-        ⚠️ Par défaut dry_run=True : scanne et rapporte sans modifier.
-        Passez dry_run=False pour appliquer les corrections.
-
-        Args:
-            space_id: Espace à réparer
-            dry_run: True = scan seul, False = correction effective
-
-        Returns:
-            Liste des fichiers réparés + doublons détectés
+        """Operator tool: not advertised in tools/list. Scan (dry_run=true) or repair (dry_run=false) malformed memory-bank paths, invisible characters and duplicates. Requires permission manage and access to space_id.
         """
         from ..auth.context import check_access, check_manage_permission
         from ..core.storage import (
@@ -1034,35 +986,18 @@ def register(mcp: MCPServer) -> int:
             return safe_error(e, "bank")
 
     @mcp.tool(
-        description="Write or replace a Memory Bank file directly.",
         annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True),
     )
     async def bank_write(
-        space_id: Annotated[str, Field(description="Space identifier")],
+        space_id: Annotated[str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")],
         filename: Annotated[
-            str, Field(description="Bank filename (for example, 'activeContext.md')")
+            str, Field(description="Memory-bank filename, for example 'activeContext.md'")
         ],
         content: Annotated[
-            str, Field(description="Complete Markdown file content")
+            str, Field(description="Complete Markdown file content, for example '# Active context\n...'")
         ],
     ) -> dict:
-        """
-        Écrit ou remplace un fichier dans la Memory Bank (manage).
-
-        ⚠️ Cet outil contourne la consolidation LLM — il écrit directement
-        dans la bank. À utiliser pour les corrections manuelles quand la
-        consolidation échoue (doublons, contenu tronqué, migration).
-
-        Si un fichier avec le même nom existe déjà, il est remplacé.
-        Les éventuels doublons Unicode sont automatiquement nettoyés.
-
-        Args:
-            space_id: Identifiant de l'espace
-            filename: Nom du fichier à écrire
-            content: Contenu Markdown complet
-
-        Returns:
-            Statut de l'écriture avec taille du fichier
+        """Operator tool: not advertised in tools/list. Canonical name: mid_write (also registered as bank_write). Write or replace one memory-bank file directly, bypassing consolidation, for a manual correction. Requires permission manage and access to space_id. Agents write with short_note and consolidate with mid_consolidate.
         """
         from ..auth.context import check_access, check_manage_permission
         from ..core.storage import get_storage
@@ -1097,10 +1032,17 @@ def register(mcp: MCPServer) -> int:
             # Sanitiser le filename
             sanitized = _sanitize_filename(filename)
             if not sanitized:
-                return {
-                    "status": "error",
-                    "message": f"Invalid filename: '{filename}'",
-                }
+                from .guidance import ErrorKind, argument_refusal
+
+                return argument_refusal(
+                    f"Invalid filename: '{filename}'",
+                    kind=ErrorKind.INVALID_ARGUMENT,
+                    arguments=["filename"],
+                    reason=(
+                        "filename is a Markdown filename made of visible "
+                        "characters, for example 'activeContext.md'."
+                    ),
+                )
 
             # Re-valider après sanitisation Unicode (défense en profondeur :
             # _sanitize_filename pourrait ne pas être idempotent face à
@@ -1163,32 +1105,17 @@ def register(mcp: MCPServer) -> int:
 
     @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True))
     async def bank_delete(
-        space_id: Annotated[str, Field(description="Space identifier")],
-        filename: Annotated[str, Field(description="Bank filename to delete")],
+        space_id: Annotated[str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")],
+        filename: Annotated[str, Field(description="Memory-bank filename to delete, for example 'progress.md'; subdirectories are allowed")],
         confirm: Annotated[
             bool,
             Field(
                 default=False,
-                description="Must be true to confirm deletion",
+                description='true confirms the deletion; false refuses it. Default: false',
             ),
         ] = False,
     ) -> dict:
-        """
-        Delete one file from a space's memory bank (manage permission).
-
-        Also removes duplicate objects whose normalized filename matches the
-        requested filename.
-
-        This operation is irreversible. Read the file first if its content must
-        be preserved. An explicit ``confirm=True`` acknowledgement is required.
-
-        Args:
-            space_id: Space containing the file.
-            filename: Filename to delete; subdirectories are allowed.
-            confirm: Must be true to acknowledge the destructive operation.
-
-        Returns:
-            Number of deleted objects, including normalized duplicates.
+        """Operator tool: not advertised in tools/list. Canonical name: mid_delete (also registered as bank_delete). Delete one memory-bank file and its normalized duplicates; confirm=true is required and the deletion cannot be undone. Requires permission manage and access to space_id.
         """
         from ..auth.context import check_access, check_manage_permission
         from ..core.storage import get_storage, bank_relpath
@@ -1208,13 +1135,15 @@ def register(mcp: MCPServer) -> int:
             # outils destructifs : space_delete, backup_restore, backup_delete,
             # admin_gc_notes).
             if not confirm:
-                return {
-                    "status": "error",
-                    "message": (
+                from .guidance import confirm_required
+
+                return confirm_required(
+                    (
                         "Deletion refused: confirm=True is required to delete "
                         "a bank file (this action is irreversible)."
                     ),
-                }
+                    "delete the bank file",
+                )
 
             storage = get_storage()
 
@@ -1279,7 +1208,6 @@ def register(mcp: MCPServer) -> int:
             return safe_error(e, "bank")
 
     @mcp.tool(
-        description="Scan for or compact oversized Memory Bank files with the LLM.",
         # A real compaction creates a fresh persistent preimage snapshot before
         # applying its verified bank edits, so retrying is not idempotent even
         # when the resulting bank text would be equivalent.
@@ -1287,35 +1215,17 @@ def register(mcp: MCPServer) -> int:
     )
     async def bank_compact(
         space_id: Annotated[
-            str, Field(description="Identifier of the space to compact")
+            str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")
         ],
         dry_run: Annotated[
             bool,
             Field(
                 default=True,
-                description="True = scan only (report without changes); False = run LLM compaction",
+                description='true scans only and reports without changes; false runs the model compaction. Default: true',
             ),
         ] = True,
     ) -> dict:
-        """
-        Compact oversized bank files through a strict LLM plan (manage).
-
-        File limits and result sizes are persisted UTF-8 bytes. `dry_run=True`
-        scans without mutation. An apply prepares every candidate before the
-        first write, is permitted only on a DirectLocal route, and refuses a
-        shared Project Mesh route before provider, preimage, or bank effects.
-        Context-incompatible documents fail closed; there is no implicit split
-        or multipart/crash-durable recovery mode.
-
-        The per-space consolidation lock protects the local apply. If a
-        consolidation is in progress, the result is `conflict`.
-
-        Args:
-            space_id: Space to compact.
-            dry_run: True = read-only scan, False = guarded local apply.
-
-        Returns:
-            Safe compaction report with per-file byte metrics and diagnostics.
+        """Operator tool: not advertised in tools/list. Scan (dry_run=true) or compact (dry_run=false) oversized memory-bank files with the model. An apply runs only on a DirectLocal route and refuses a shared space before any write; a conflict result means a consolidation holds the space lock. Requires permission manage and access to space_id.
         """
         from ..auth.context import check_access, check_manage_permission
         from ..core.locks import get_lock_manager
@@ -1363,11 +1273,21 @@ def register(mcp: MCPServer) -> int:
             if not dry_run:
                 lock = get_lock_manager().consolidation(space_id)
                 if lock.locked():
+                    from .guidance import remediation
+
                     return {
                         "status": "conflict",
                         "message": (
                             f"Consolidation is in progress for '{space_id}'. "
                             "Try again in a few minutes."
+                        ),
+                        "error_kind": "operation_in_progress",
+                        "remediation": remediation(
+                            reason=(
+                                "Wait for the running consolidation to finish, "
+                                "then retry; do not submit a second consolidation."
+                            ),
+                            retryable=True,
                         ),
                     }
                 async with lock:
@@ -1459,14 +1379,14 @@ def register(mcp: MCPServer) -> int:
             )
 
     @mcp.tool(
-        description="Resume a retained MID capture paused after repeated invalid output or inference timeouts.",
         annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True),
     )
     async def mid_archive_retry(
-        space_id: Annotated[str, Field(description="Space owning the retained capture")],
-        preimage_id: Annotated[str, Field(description="Exact retained preimage ID, including the space prefix")],
+        space_id: Annotated[str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")],
+        preimage_id: Annotated[str, Field(description="Exact retained preimage identifier including the space prefix, for example 'project-alpha/preimage-1a2b3c'")],
     ) -> dict:
-        """Manage-only DirectLocal retry; preserves sources, target and admitted calls."""
+        """Operator tool: not advertised in tools/list. Resume a retained mid-memory capture paused after repeated invalid output or inference timeouts; runs on a DirectLocal route only and keeps the sources, target and admitted calls. Requires permission manage and access to space_id.
+        """
         from ..auth.context import check_access, check_manage_permission
         from ..core.mid_archive import ERRORS
         from ..core.mid_archive_projection import MidArchiveProjector

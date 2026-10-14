@@ -22,6 +22,8 @@ des permissions via les helpers auth/context.py.
 from typing import Annotated
 
 from mcp.server.mcpserver import MCPServer
+
+from ..auth.context import authentication_required
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
@@ -43,21 +45,19 @@ def register(mcp: MCPServer) -> int:
             str,
             Field(
                 description=(
-                    "Unique space identifier: letters, numbers, hyphens, and "
-                    "underscores; maximum 64 characters"
+                    "Unique space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'"
                 )
             ),
         ],
         description: Annotated[
-            str, Field(description="Short description of the space")
+            str, Field(description="Short description of the space, for example 'Payment service memory'")
         ],
         rules: Annotated[
             str,
             Field(
                 default="",
                 description=(
-                    "Markdown consolidation rules that define the memory bank "
-                    "structure; empty uses DEFAULT_RULES_FILE"
+                    'Markdown consolidation rules that define the memory-bank structure, for example the content of RULES/live-mem.standard.memory.bank.md. Default: empty, which loads the configured default rules file'
                 ),
             ),
         ] = "",
@@ -65,28 +65,16 @@ def register(mcp: MCPServer) -> int:
             str,
             Field(
                 default="",
-                description="Optional informational owner of the space",
+                description="Informational owner of the space, for example 'platform-team'. Default: empty",
             ),
         ] = "",
     ) -> dict:
-        """
-        Create a memory space with its consolidation rules.
-
-        Rules define the structure and expected content of the memory bank.
-        A manage-level operator can update them later with
-        ``space_update_rules``.
-
-        If ``rules`` is empty, the server loads the configured default rules.
-
-        Args:
-            space_id: Unique identifier using letters, numbers, hyphens, and
-                underscores; maximum 64 characters.
-            description: Short space description.
-            rules: Markdown rules; empty selects the configured defaults.
-            owner: Optional informational owner.
-
-        Returns:
-            Details of the created space.
+        """Create a memory space with its consolidation rules.
+        Use when: an operator provisions a new space for a project.
+        Do not use when: the space exists (call space_info) or its rules must change (an operator calls space_update_rules).
+        Before calling: permission manage; the new space_id must match the identifier format; a token with read,write cannot create a space, an operator must.
+        Peer tools: space_invite_token (after, to grant agent tokens access), space_rules (after, to read the rules back).
+        Result: the space exists; invite the agent tokens, which then call space_rules, mid_read_all and short_read.
         """
         from pathlib import Path
         from ..auth.context import (
@@ -95,6 +83,13 @@ def register(mcp: MCPServer) -> int:
         )
         from ..config import get_settings
         from ..core.space import get_space_service
+        from .guidance import ErrorKind, argument_refusal
+
+        rules_reason = (
+            "Pass rules as the Markdown consolidation rules of the space, for "
+            "example the content of a template under RULES/ such as "
+            "live-mem.standard.memory.bank.md."
+        )
 
         try:
             # LM2-11 : provisionner un espace est une opération manage, pas une
@@ -105,7 +100,7 @@ def register(mcp: MCPServer) -> int:
                 return manage_err
             actor = get_effective_token_info()
             if actor is None:
-                return {"status": "error", "message": "Authentication required"}
+                return authentication_required()
 
             # Si rules vide, charger les rules par défaut
             effective_rules = rules
@@ -116,18 +111,22 @@ def register(mcp: MCPServer) -> int:
                     if rules_path.is_file():
                         effective_rules = rules_path.read_text(encoding="utf-8")
                     else:
-                        return {
-                            "status": "error",
-                            "message": f"Default rules file not found: {settings.default_rules_file}",
-                        }
+                        return argument_refusal(
+                            f"Default rules file not found: {settings.default_rules_file}",
+                            kind=ErrorKind.MISSING_ARGUMENT,
+                            arguments=["rules"],
+                            reason=rules_reason,
+                        )
                 else:
-                    return {
-                        "status": "error",
-                        "message": (
+                    return argument_refusal(
+                        (
                             "The 'rules' parameter is required. "
                             "No default rules file is configured (DEFAULT_RULES_FILE)."
                         ),
-                    }
+                        kind=ErrorKind.MISSING_ARGUMENT,
+                        arguments=["rules"],
+                        reason=rules_reason,
+                    )
 
             return await get_space_service().create(
                 space_id=space_id,
@@ -148,36 +147,24 @@ def register(mcp: MCPServer) -> int:
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
     async def space_update(
         space_id: Annotated[
-            str, Field(description="Identifier of the space to update")
+            str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")
         ],
         description: Annotated[
             str,
             Field(
                 default="",
-                description="New description (empty means no change)",
+                description="New description, for example 'Payment service memory'. Default: empty, no change",
             ),
         ] = "",
         owner: Annotated[
             str,
             Field(
                 default="",
-                description="New owner (empty means no change)",
+                description="New owner, for example 'platform-team'. Default: empty, no change",
             ),
         ] = "",
     ) -> dict:
-        """
-        Update a space's description or owner metadata.
-
-        Rules are managed separately through ``space_update_rules``. Only
-        non-empty metadata fields are changed.
-
-        Args:
-            space_id: Space to update.
-            description: New description; empty leaves it unchanged.
-            owner: New owner; empty leaves it unchanged.
-
-        Returns:
-            Changed fields and their new values.
+        """Operator tool: not advertised in tools/list. Update the description or owner of a space; only non-empty fields change. Requires permission write and access to space_id. Rules change through space_update_rules.
         """
         from ..auth.context import check_access, check_write_permission
         from ..core.space import get_space_service
@@ -203,24 +190,10 @@ def register(mcp: MCPServer) -> int:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
     async def space_update_rules(
-        space_id: Annotated[str, Field(description="Space identifier")],
-        rules: Annotated[str, Field(description="Complete replacement rules in Markdown")],
+        space_id: Annotated[str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")],
+        rules: Annotated[str, Field(description='Complete replacement rules in Markdown, for example the content of a template under RULES/')],
     ) -> dict:
-        """
-        Replace a space's consolidation rules.
-
-        This manage-level operation replaces the complete Markdown rules
-        document without deleting or recreating the space.
-
-        Use it for rule corrections, template migrations, or consolidation
-        policy changes.
-
-        Args:
-            space_id: Space to update.
-            rules: Complete replacement rules in Markdown.
-
-        Returns:
-            Size of the stored rules document.
+        """Operator tool: not advertised in tools/list. Replace the consolidation rules of a space with a complete Markdown document, without recreating the space. Requires permission manage and access to space_id. Agents read the rules with space_rules.
         """
         from ..auth.context import check_access, check_manage_permission
         from ..core.space import get_space_service
@@ -245,17 +218,14 @@ def register(mcp: MCPServer) -> int:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def space_list(
-        include_counts: Annotated[bool, Field(description="Include short-note and bank-file counts; False reads only space metadata")] = True,
+        include_counts: Annotated[bool, Field(description='true includes short-note and bank-file counts; false reads only space metadata. Default: true')] = True,
     ) -> dict:
-        """
-        List memory spaces accessible to the current credential.
-
-        Returns metadata (including cumulative consolidation counters) for each
-        visible space. Counts are included by default; include_counts=False
-        skips short-note and bank-file listings, retaining credential filtering.
-
-        Returns:
-            Accessible spaces and summary statistics.
+        """List the memory spaces this token can access, with their statistics.
+        Use when: the agent does not know which space to work in, or a refusal listed accessible_spaces.
+        Do not use when: the agent already knows its space (call space_rules, mid_read_all and short_read) or wants to create one (an operator calls space_create).
+        Before calling: permission read; no space access needed; no prior call.
+        Peer tools: system_whoami (scope), space_info (one space in detail).
+        Result: pick the space_id from spaces; an empty list means a manager must invite the token with space_invite_token.
         """
         from ..auth.context import _get_effective_token_info
         from ..core.space import get_space_service
@@ -264,7 +234,7 @@ def register(mcp: MCPServer) -> int:
             # Récupérer les space_ids autorisés depuis le token (données fraîches)
             token_info = _get_effective_token_info()
             if token_info is None:
-                return {"status": "error", "message": "Authentication required"}
+                return authentication_required()
 
             permissions = token_info.get("permissions", [])
             allowed = token_info.get("allowed_resources", [])
@@ -285,19 +255,14 @@ def register(mcp: MCPServer) -> int:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def space_info(
-        space_id: Annotated[str, Field(description="Space identifier")],
+        space_id: Annotated[str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")],
     ) -> dict:
-        """
-        Return detailed metadata and statistics for a space.
-
-        Includes short-note counts and sizes, memory-bank file statistics, and
-        consolidation status.
-
-        Args:
-            space_id: Space to inspect.
-
-        Returns:
-            Space metadata and statistics.
+        """Return the metadata and statistics of one space.
+        Use when: the agent needs note counts, bank file statistics or the consolidation status of a space.
+        Do not use when: the agent needs the rules (call space_rules) or the bank content (call mid_read_all).
+        Before calling: permission read; access to space_id; no prior call.
+        Peer tools: space_list (before), space_summary (rules, bank and statistics in one call).
+        Result: read the counts; no action is needed.
         """
         from ..auth.context import check_access
         from ..core.space import get_space_service
@@ -315,20 +280,14 @@ def register(mcp: MCPServer) -> int:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def space_rules(
-        space_id: Annotated[str, Field(description="Space identifier")],
+        space_id: Annotated[str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")],
     ) -> dict:
-        """
-        Read the current consolidation rules for a space.
-
-        Rules define the intended memory-bank structure and guide the
-        consolidator when it creates or updates bank files. A manage-level
-        operator can replace them with ``space_update_rules``.
-
-        Args:
-            space_id: Space whose rules should be returned.
-
-        Returns:
-            Current rules as Markdown.
+        """Read the consolidation rules of a space: the memory-bank structure the consolidator follows.
+        Use when: at the start of every task, as the first of the three start-of-task calls, and before writing notes in a space the agent has not read yet.
+        Do not use when: the agent wants to change the rules; an operator with permission manage calls space_update_rules.
+        Before calling: permission read; access to space_id; no prior call.
+        Peer tools: mid_read_all and short_read (after, the other two start-of-task calls), space_summary (the three in one call).
+        Result: read the rules before writing notes; if the call fails, times out or returns a non-ok status, stop before any mutation.
         """
         from ..auth.context import check_access
         from ..core.space import get_space_service
@@ -346,19 +305,14 @@ def register(mcp: MCPServer) -> int:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def space_summary(
-        space_id: Annotated[str, Field(description="Space identifier")],
+        space_id: Annotated[str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")],
     ) -> dict:
-        """
-        Load a complete space bootstrap: rules, memory bank, and statistics.
-
-        Use this at session startup when an agent needs the whole compact
-        project context in one request.
-
-        Args:
-            space_id: Space to summarize.
-
-        Returns:
-            Rules, complete bank files, residual summary, and statistics.
+        """Load a space bootstrap in one call: rules, every memory-bank file, the residual summary and statistics.
+        Use when: the agent needs the whole compact context of a space in one request at session start.
+        Do not use when: the agent needs recent notes (call short_read, which this tool does not include) or one bank file again (call mid_read).
+        Before calling: permission read; access to space_id; no prior call.
+        Peer tools: space_rules and mid_read_all (the same content as separate calls), short_read (after).
+        Result: read the rules and bank files to identify the current focus before working.
         """
         from ..auth.context import check_access
         from ..core.space import get_space_service
@@ -375,25 +329,14 @@ def register(mcp: MCPServer) -> int:
             return safe_error(e, "space")
 
     @mcp.tool(
-        description="Export a space as a base64-encoded tar archive.",
         annotations=ToolAnnotations(readOnlyHint=True),
     )
     async def space_export(
         space_id: Annotated[
-            str, Field(description="Identifier of the space to export")
+            str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")
         ],
     ) -> dict:
-        """
-        Exporte un espace complet en archive tar.gz (base64).
-
-        L'archive contient tous les fichiers de l'espace : _meta.json,
-        _rules.md, notes live, fichiers bank, synthèse.
-
-        Args:
-            space_id: Identifiant de l'espace
-
-        Returns:
-            Archive base64, taille et nombre de fichiers
+        """Operator tool: not advertised in tools/list. Export a space as a base64-encoded tar archive. Requires permission read and access to space_id.
         """
         from ..auth.context import check_access
         from ..core.space import get_space_service
@@ -410,18 +353,17 @@ def register(mcp: MCPServer) -> int:
             return safe_error(e, "space")
 
     @mcp.tool(
-        description="Permanently delete a space and its coordinated state.",
         annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False),
     )
     async def space_delete(
         space_id: Annotated[
-            str, Field(description="Identifier of the space to delete")
+            str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")
         ],
         confirm: Annotated[
             bool,
             Field(
                 default=False,
-                description="Must be true to confirm deletion",
+                description='true confirms the deletion; false refuses it. Default: false',
             ),
         ] = False,
         unsafe_recovery: Annotated[
@@ -429,9 +371,7 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default=False,
                 description=(
-                    "Explicitly allow deletion of a shared space that is in an "
-                    "unsafe recovery state. This never bypasses corruption "
-                    "checks; corrupted state still fails closed."
+                    'true allows the deletion of a shared space in an unsafe recovery state (corrupt state still fails closed); false refuses it. Default: false'
                 ),
             ),
         ] = False,
@@ -440,47 +380,12 @@ def register(mcp: MCPServer) -> int:
             Field(
                 default=False,
                 description=(
-                    "Explicitly remove surviving token scopes only when the "
-                    "space prefix is already confirmed empty after a known "
-                    "older or interrupted deletion. Never set this merely "
-                    "because an ID is absent: it can destroy intentional "
-                    "future-space pre-grants."
+                    'true removes surviving token scopes only when the space prefix is already confirmed empty after an older or interrupted deletion; false keeps them. Never set it merely because an identifier is absent: it can destroy intentional pre-grants. Default: false'
                 ),
             ),
         ] = False,
     ) -> dict:
-        """
-        Supprime un espace et TOUTES ses données (irréversible).
-
-        ⚠️ ATTENTION : cette opération est destructive et ne peut pas être annulée.
-        Le paramètre confirm doit être True pour confirmer la suppression.
-        Nécessite la permission manage ou admin.
-
-        Deleting a shared Hivemind space also removes its coordination state and
-        forces peers to resynchronize. The operation therefore refuses shared
-        unsafe state by default. Set ``unsafe_recovery=True`` to acknowledge
-        and authorize that recovery action explicitly. Corrupted state still
-        fails closed.
-
-        A successful deletion also removes this ``space_id`` from every
-        persisted token allowlist. Any registry rewrite is reported as deleted
-        only after a fresh token-store read confirms zero remaining references.
-        If the prefix is already absent, grants are preserved by default because
-        they may be intentional future-space pre-grants. Set
-        ``recover_access_grants=True`` only to resume a known older or
-        interrupted deletion; grants-only success is ``grants_cleaned``.
-
-        Args:
-            space_id: Identifiant de l'espace à supprimer
-            confirm: Doit être True pour confirmer (sécurité)
-            unsafe_recovery: Explicitly authorize deletion of a shared space in
-                an unsafe recovery state.
-            recover_access_grants: Explicitly clean surviving scopes for a
-                known deletion whose prefix is already empty.
-
-        Returns:
-            Confirmation de suppression avec nombres de fichiers supprimés et
-            de grants révoqués, ou recovery typée si une étape est ambiguë.
+        """Operator tool: not advertised in tools/list. Permanently delete a space and its coordinated state; confirm=true is required and the deletion cannot be undone. Requires permission manage and access to space_id.
         """
         from ..auth.context import (
             check_access,
@@ -500,17 +405,19 @@ def register(mcp: MCPServer) -> int:
                 return manage_err
             actor = get_effective_token_info()
             if actor is None:
-                return {"status": "error", "message": "Authentication required"}
+                return authentication_required()
 
             # Sécurité : confirm obligatoire
             if not confirm:
-                return {
-                    "status": "error",
-                    "message": (
+                from .guidance import confirm_required
+
+                return confirm_required(
+                    (
                         "Deletion refused: confirm=True is required. "
                         "This operation cannot be undone."
                     ),
-                }
+                    "delete the space",
+                )
 
             return await get_space_service().delete(
                 space_id,

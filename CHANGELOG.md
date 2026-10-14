@@ -17,6 +17,43 @@ linked guides when installing or upgrading.
 
 ### Added
 
+- Guidance error payload on every refused tool call. A refusal keeps
+  `status` and `message` and adds `error_kind` (one value from a closed set
+  of fourteen causes, for example `space_access_denied`,
+  `permission_insufficient`, `missing_argument`, `write_route_refused`) and a
+  `remediation` object (`reason`, `retryable` and, when known, `next_tool`,
+  `arguments`, `missing_arguments`, `required_prior_step`). A permission
+  refusal names the required and current permissions; a space refusal lists
+  the accessible spaces and names `space_list`; an argument refusal names the
+  argument, the format and an example; a write to a shared space is refused
+  with server-owned text instead of "Internal server error". See "Guidance
+  error payload" in `docs/MCP_TOOLS_SPEC.md`.
+- MCP error delivery: over `/mcp`, a refused call is an MCP error result
+  (`isError: true`) carrying the payload as `structuredContent` and as JSON
+  text. `MCP_REFUSAL_IS_ERROR=false` restores the previous delivery
+  (successful results with the same payload) for now; a later release
+  removes the setting. The `/api/tool` proxy returns the payload unchanged.
+- Refusal observability: the `request` audit entry carries `tool` and
+  `error_kind` for a refused call, and `/metrics` exposes
+  `livemem_tool_refusals_total{tool,error_kind}`.
+- Server instructions at `initialize`: the memory-bank rules (start-of-task
+  calls, write discipline, end-of-block consolidation, permission model,
+  long memory, reading a refusal), identical for every token.
+- Tool descriptions rewritten to a fixed contract: purpose, "Use when",
+  "Do not use when", "Before calling" (permission and space access), "Peer
+  tools" and "Result" for every agent tool; aliases name their canonical
+  tool; operator tools say so; every parameter states its allowed values or
+  format and its default.
+
+### Changed
+
+- `bank_compact` failures carry the `remediation` object instead of a
+  top-level string: the former text is `remediation.reason`. The CLI shows
+  the reason under "remediation:".
+- The operator tool guard refusal (`status: "forbidden"`) now also carries
+  `error_kind` (`operator_tools_refused` or `audience_unresolved`) and a
+  `remediation` with `retryable: false`.
+
 - Per-bearer-token guard for the hidden operator tools. Each token in
   `_system/tokens.json` carries `operator_tools`; when it is `false`, every
   `audience=operator` tool of `docs/TOOL_EXPOSURE.md` (`mid_write` and its

@@ -157,6 +157,11 @@ tokens, endpoints, or secrets in project instructions, notes, long memory,
 commits, or logs.
 ```
 
+The server sends the same rules as MCP instructions in the `initialize`
+result, so an agent whose client shows server instructions receives them
+without this block. The block stays because some MCP clients do not show
+server instructions to the model; keep both, they state the same rules.
+
 ### File-specific placement
 
 - **Codex:** put the block in the repository's `AGENTS.md`.

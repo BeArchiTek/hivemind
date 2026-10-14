@@ -325,7 +325,7 @@ async def test_admin_tool_permission_boundary_and_read_only_annotation():
     assert tool.annotations.read_only_hint is True
 
     missing = await _call_as(fn, None)
-    assert missing == {"status": "error", "message": "Authentication required"}
+    assert (missing["status"], missing["message"]) == ("error", "Authentication required")
 
     non_admin = await _call_as(
         fn,
@@ -335,10 +335,10 @@ async def test_admin_tool_permission_boundary_and_read_only_annotation():
             "allowed_resources": [],
         },
     )
-    assert non_admin == {
-        "status": "error",
-            "message": "The 'admin' permission is required for this operation",
-    }
+    assert (non_admin["status"], non_admin["message"]) == (
+        "error",
+        "The 'admin' permission is required for this operation",
+    )
 
 
 @pytest.mark.asyncio
