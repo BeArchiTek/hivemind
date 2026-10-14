@@ -20,6 +20,8 @@ from ..config import redact_proxy_secrets as _redact_proxy_secrets
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
+
+from ..auth.context import authentication_required
 from mcp.types import ToolAnnotations
 
 _logger = logging.getLogger("live_mem.system")
@@ -38,16 +40,12 @@ def register(mcp: MCPServer) -> int:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def system_health() -> dict:
-        """
-        Check the health of the Hivemind service.
-
-        Tests S3 and LLM provider connectivity and reports the status of each
-        dependency. The MCP transport requires valid authentication; this
-        handler adds no permission check beyond that transport boundary.
-        ``GET /health`` remains the public HTTP health probe.
-
-        Returns:
-            Overall health and per-dependency details.
+        """Check the health of the Hivemind service and its storage and model dependencies.
+        Use when: a call failed with error_kind internal_failure, or the agent must confirm the dependencies answer before a work block.
+        Do not use when: the agent needs its own permissions (call system_whoami). Do not poll it between calls.
+        Before calling: permission public (any valid bearer token); no space access needed; no prior call.
+        Peer tools: system_about, system_whoami.
+        Result: when status is not ok, report the degraded dependency to the user and stop before any mutation.
         """
         from ..config import get_settings
 
@@ -123,15 +121,12 @@ def register(mcp: MCPServer) -> int:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def system_about() -> dict:
-        """
-        Describe the Hivemind MCP service.
-
-        Returns the service version and the tools visible to the authenticated
-        caller. The MCP transport requires valid authentication; this handler
-        adds no permission check beyond that transport boundary.
-
-        Returns:
-            Service metadata and the caller's discoverable tool list.
+        """Describe the Hivemind MCP service: its version and the tools this token can view.
+        Use when: the agent needs the server version or wants to confirm which tools its token advertises.
+        Do not use when: the agent needs its own identity or scope (call system_whoami) or the dependency status (call system_health).
+        Before calling: permission public (any valid bearer token); no space access needed; no prior call.
+        Peer tools: system_whoami (identity and scope), system_health (dependency status).
+        Result: read the version and the tool list; no action is needed.
         """
         from ..config import get_settings
 
@@ -184,14 +179,7 @@ def register(mcp: MCPServer) -> int:
 
     @mcp.tool()
     async def inference_self_test() -> dict:
-        """Run the bounded deep inference readiness check.
-
-        Requires manage permission. The check uses fixed synthetic inputs and
-        the process-frozen configured roles; it accepts no caller-selected
-        provider, endpoint, model, credential, prompt, or embedding content.
-
-        Returns:
-            Cached or freshly collected secret-free role readiness evidence.
+        """Operator tool: not advertised in tools/list. Run the bounded deep inference readiness check with fixed synthetic inputs and the configured roles; it may spend provider budget and its result is cached for five minutes. Requires permission manage.
         """
         # Authorization MUST precede runtime resolution or adapter access: a
         # denied caller cannot trigger provider construction or paid egress.
@@ -210,32 +198,31 @@ def register(mcp: MCPServer) -> int:
                 "inference_self_test failed: %s",
                 type(exc).__name__,
             )
-            return {
-                "status": "error",
-                "readiness": "not_ready",
-                "evidence": "none",
-                "cached": False,
-                "message": "Inference self-test unavailable",
-            }
+            from .guidance import INTERNAL_FAILURE_REASON, ErrorKind, refusal, remediation
+
+            return refusal(
+                "Inference self-test unavailable",
+                ErrorKind.INTERNAL_FAILURE,
+                readiness="not_ready",
+                evidence="none",
+                cached=False,
+                remediation=remediation(reason=INTERNAL_FAILURE_REASON, retryable=False),
+            )
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def system_whoami() -> dict:
-        """
-        Describe the credential used for the current request.
-
-        Returns the agent name, authentication type, permissions, accessible
-        spaces, and available token metadata such as email and timestamps.
-
-        Requires valid authentication with at least read permission.
-
-        Returns:
-            The current caller identity and authorization scope.
+        """Describe the token used for the current request: agent name, permissions, accessible spaces and operator tool access.
+        Use when: a call was refused with error_kind space_access_denied or permission_insufficient, or the agent must know which spaces it can work in.
+        Do not use when: the agent needs the spaces with their statistics (call space_list).
+        Before calling: permission read; no space access needed; no prior call.
+        Peer tools: space_list (the spaces behind accessible_spaces), space_invite_token (a manager grants access to a space).
+        Result: use permissions and the accessible spaces to choose the next call; a token with no space needs an invitation from a manager.
         """
         from ..auth.context import get_effective_token_info
 
         token_info = get_effective_token_info()
         if token_info is None:
-            return {"status": "error", "message": "Authentication required"}
+            return authentication_required()
 
         from .exposure import token_allows_operator_tools
 

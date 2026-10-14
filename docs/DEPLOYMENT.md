@@ -224,6 +224,26 @@ store. The WAF stays the only exposed entrypoint.
 docker compose up --build -d --wait
 ```
 
+### MCP error delivery of refused tool calls
+
+A refused tool call (a result whose `status` is `error` or `forbidden`)
+is delivered over `/mcp` as an MCP error result (`isError: true`) whose
+payload keeps `status` and `message` and adds `error_kind` and
+`remediation` (see "Guidance error payload" in
+[MCP_TOOLS_SPEC.md](MCP_TOOLS_SPEC.md)). The CLI, the admin console and
+`hivemind-ingest` show `message` as before.
+
+`MCP_REFUSAL_IS_ERROR` (default `true`) controls only the `isError` flag:
+
+- `true`: refused calls are MCP error results.
+- `false`: refused calls are successful MCP results with the same
+  payload, as in 1.6.1. The server logs one warning at startup.
+
+The payload, the audit entry and the `livemem_tool_refusals_total`
+counter are the same in both modes. This setting is temporary: a later
+release removes it and keeps the error delivery only; which release is
+not decided yet.
+
 ### Qdrant deployment boundary
 
 The supported topology dedicates one complete Qdrant instance exclusively to

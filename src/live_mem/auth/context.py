@@ -28,6 +28,12 @@ from contextvars import ContextVar
 from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 
 from ..core.memory_id import reserved_space_error
+from ..tools.guidance import (
+    INTERNAL_FAILURE_REASON,
+    ErrorKind,
+    refusal,
+    remediation,
+)
 
 
 # Request-scoped identity attached by ``AuthMiddleware`` after bearer
@@ -256,6 +262,100 @@ def _get_effective_token_info() -> Optional[dict]:
     return get_effective_token_info()
 
 
+# Remediation sentences of the guard refusals (specification 001). Built from
+# literals, tool names, argument names and permission names only (FR-010).
+SPACE_ID_FORMAT_REASON = (
+    "space_id must start with a letter or digit and contain only letters, "
+    "digits, hyphens and underscores, at most 64 characters, for example "
+    "'project-alpha'."
+)
+AUTHENTICATION_MISSING_REASON = (
+    "Send a bearer token in the Authorization header; an operator issues "
+    "tokens with token_create."
+)
+CLIENT_NAME_MISSING_REASON = (
+    "This bearer token has no client_name identity, so the call cannot be "
+    "attributed to an agent; an operator must issue a token with a client_name."
+)
+TOKEN_SCOPE_CHANGED_REASON = (
+    "An operator changed this token's scope during the session; refresh the "
+    "tool list (reconnect so tools/list matches the new scope), then retry."
+)
+_PERMISSION_ACTORS = {"write": "manage or admin", "manage": "manage or admin", "admin": "admin"}
+
+
+def token_scope_changed_for_current_request() -> bool:
+    """Whether the token of the current request was re-scoped or revoked.
+
+    Reads the token hash of the MCP request identity when present, else the
+    ambient contextvar, and reports whether that hash is tombstoned
+    (``_invalidated_token_hashes``). A refusal for a tombstoned token tells
+    the agent to refresh its tool list (FR-009).
+    """
+    hashes: list[Any] = []
+    _has_mcp_context, identity = get_mcp_request_token_info()
+    if isinstance(identity, Mapping):
+        hashes.append(identity.get("token_hash"))
+    ambient = current_token_info.get()
+    if isinstance(ambient, Mapping):
+        hashes.append(ambient.get("token_hash"))
+    return any(
+        isinstance(h, str) and h and h in _invalidated_token_hashes for h in hashes
+    )
+
+
+def authentication_required() -> dict:
+    """The ``Authentication required`` refusal with its guidance fields."""
+    if token_scope_changed_for_current_request():
+        return refusal(
+            "Authentication required",
+            ErrorKind.TOKEN_SCOPE_CHANGED,
+            remediation=remediation(
+                reason=TOKEN_SCOPE_CHANGED_REASON,
+                retryable=True,
+                required_prior_step="refresh the tool list",
+            ),
+        )
+    return refusal(
+        "Authentication required",
+        ErrorKind.AUTHENTICATION_MISSING,
+        remediation=remediation(reason=AUTHENTICATION_MISSING_REASON, retryable=True),
+    )
+
+
+def client_name_missing(message: str) -> dict:
+    """The refusal for a bearer token without a ``client_name`` identity.
+
+    The agent cannot correct this itself (Q6, decided 2026-10-14).
+    """
+    return refusal(
+        message,
+        ErrorKind.AUTHENTICATION_MISSING,
+        remediation=remediation(reason=CLIENT_NAME_MISSING_REASON, retryable=False),
+    )
+
+
+def permission_insufficient(required: str, permissions: list) -> dict:
+    """The permission refusal: names the required and current permissions,
+    states that an operator can act, and suggests no bypass (FR-004)."""
+    current = [p for p in permissions if isinstance(p, str)]
+    held = ", ".join(current) if current else "no permission"
+    return refusal(
+        f"The '{required}' permission is required for this operation",
+        ErrorKind.PERMISSION_INSUFFICIENT,
+        required_permission=required,
+        current_permissions=current,
+        remediation=remediation(
+            reason=(
+                f"This token holds {held}. An operator with "
+                f"{_PERMISSION_ACTORS[required]} must perform this action or "
+                f"issue a token with {required}."
+            ),
+            retryable=False,
+        ),
+    )
+
+
 def _evaluate_access(
     token_info: Optional[dict], resource_id: str
 ) -> Optional[dict]:
@@ -280,15 +380,20 @@ def _evaluate_access(
     """
     # Pas de token → accès refusé
     if token_info is None:
-        return {"status": "error", "message": "Authentication required"}
+        return authentication_required()
 
     # VULN-08 fix : valider le format du space_id AVANT de vérifier les permissions
     # Empêche les tentatives de path traversal via _system, _backups, etc.
     if not _SPACE_ID_REGEX.match(resource_id):
-        return {
-            "status": "error",
-            "message": f"Invalid space identifier: '{resource_id}'",
-        }
+        return refusal(
+            f"Invalid space identifier: '{resource_id}'",
+            ErrorKind.INVALID_SPACE_ID,
+            remediation=remediation(
+                reason=SPACE_ID_FORMAT_REASON,
+                retryable=True,
+                missing_arguments=["space_id"],
+            ),
+        )
 
     namespace_error = reserved_space_error(resource_id)
     if namespace_error is not None:
@@ -304,10 +409,27 @@ def _evaluate_access(
     # autorisé peut créer un espace ou inviter le token dans un espace.
     allowed = token_info.get("allowed_resources", [])
     if not allowed or resource_id not in allowed:
-        return {
-            "status": "error",
-            "message": f"Access denied to space '{resource_id}'",
-        }
+        accessible = [s for s in allowed if isinstance(s, str)] if allowed else []
+        if accessible:
+            reason = (
+                f"The token has no access to space '{resource_id}'. Call "
+                "space_list to view the spaces it can access, then retry with "
+                "one of them."
+            )
+        else:
+            reason = (
+                "The token has access to no space yet. A manager invites it "
+                "with space_invite_token; call system_whoami to view the "
+                "token's current scope and space_list to view its spaces."
+            )
+        return refusal(
+            f"Access denied to space '{resource_id}'",
+            ErrorKind.SPACE_ACCESS_DENIED,
+            accessible_spaces=accessible,
+            remediation=remediation(
+                reason=reason, retryable=True, next_tool="space_list"
+            ),
+        )
 
     return None  # OK
 
@@ -349,16 +471,13 @@ def check_write_permission() -> Optional[dict]:
     token_info = _get_effective_token_info()
 
     if token_info is None:
-        return {"status": "error", "message": "Authentication required"}
+        return authentication_required()
 
     permissions = token_info.get("permissions", [])
     if "write" in permissions or "manage" in permissions or "admin" in permissions:
         return None
 
-    return {
-        "status": "error",
-        "message": "The 'write' permission is required for this operation",
-    }
+    return permission_insufficient("write", permissions)
 
 
 def check_manage_permission() -> Optional[dict]:
@@ -377,16 +496,13 @@ def check_manage_permission() -> Optional[dict]:
     token_info = _get_effective_token_info()
 
     if token_info is None:
-        return {"status": "error", "message": "Authentication required"}
+        return authentication_required()
 
     permissions = token_info.get("permissions", [])
     if "manage" in permissions or "admin" in permissions:
         return None
 
-    return {
-        "status": "error",
-        "message": "The 'manage' permission is required for this operation",
-    }
+    return permission_insufficient("manage", permissions)
 
 
 def check_admin_permission() -> Optional[dict]:
@@ -403,16 +519,13 @@ def check_admin_permission() -> Optional[dict]:
     token_info = _get_effective_token_info()
 
     if token_info is None:
-        return {"status": "error", "message": "Authentication required"}
+        return authentication_required()
 
     permissions = token_info.get("permissions", [])
     if "admin" in permissions:
         return None
 
-    return {
-        "status": "error",
-        "message": "The 'admin' permission is required for this operation",
-    }
+    return permission_insufficient("admin", permissions)
 
 
 def safe_error(exception: Exception, context: str = "") -> dict:
@@ -435,10 +548,13 @@ def safe_error(exception: Exception, context: str = "") -> dict:
     logger = logging.getLogger("live_mem.tools")
     logger.exception("Error in %s: %s", context or "MCP tool", exception)
 
+    guidance = remediation(reason=INTERNAL_FAILURE_REASON, retryable=False)
     if get_settings().mcp_server_debug:
-        return {"status": "error", "message": str(exception)}
+        return refusal(str(exception), ErrorKind.INTERNAL_FAILURE, remediation=guidance)
 
-    return {"status": "error", "message": "Internal server error"}
+    return refusal(
+        "Internal server error", ErrorKind.INTERNAL_FAILURE, remediation=guidance
+    )
 
 
 # ─────────────────────────────────────────────────────────────

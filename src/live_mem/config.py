@@ -91,6 +91,12 @@ class Settings(BaseSettings):
     mcp_server_host: str = "0.0.0.0"
     mcp_server_port: int = 8002
     mcp_server_debug: bool = False
+    # Rollout setting for the MCP error delivery of refused tool calls
+    # (specification 001, FR-031). ``true`` delivers a refusal as an MCP error
+    # result (isError=true); ``false`` restores the 1.6.1 delivery (a
+    # successful result with the same payload). A later release removes this
+    # setting and keeps the error delivery only.
+    mcp_refusal_is_error: bool = True
 
     # ─── Project Mesh feature gate (public, no key material) ───
     # Only the non-secret gate enters Pydantic Settings so `.env` and process
@@ -310,6 +316,14 @@ class Settings(BaseSettings):
     def _validate_config(self) -> "Settings":
         """Semantic validation — fail fast at startup on misconfiguration."""
         errors: list[str] = []
+
+        if self.mcp_refusal_is_error is False:
+            _logger.warning(
+                "MCP_REFUSAL_IS_ERROR=false restores the 1.6.1 delivery of refused "
+                "tool calls (successful MCP results). This setting is temporary: a "
+                "later release removes it and delivers refusals as MCP error "
+                "results only."
+            )
 
         if self.mcp_request_max_bytes < 1:
             errors.append("MCP_REQUEST_MAX_BYTES must be a positive byte count")

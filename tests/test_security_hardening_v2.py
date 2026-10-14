@@ -1754,10 +1754,10 @@ class TestLM2_11_ProvisioningRequiresManage:
         finally:
             current_token_info.reset(tok)
             invalidate_token_in_store(write_only_token["token_hash"])
-        assert err == {
-            "status": "error",
-            "message": "The 'manage' permission is required for this operation",
-        }
+        assert (err["status"], err["message"]) == (
+            "error",
+            "The 'manage' permission is required for this operation",
+        )
 
 
 # =============================================================================

@@ -124,9 +124,11 @@ run unchanged after the gate.
 - A name that is not registered is answered as before ("Unknown tool").
   Discovery does not change.
 
-The refusal keeps the result convention above; the structured guidance fields
-planned for refused calls (`error_kind`, `remediation`) will name this cause
-`operator_tools_refused`.
+The refusal keeps the result convention above and carries the Guidance error
+payload fields (`error_kind` `operator_tools_refused` or
+`audience_unresolved`, and a `remediation` whose `retryable` is `false`), see
+"Guidance error payload" below; over `/mcp` it is delivered as an MCP error
+result.
 
 ### Tier grammar (ADR-0002)
 
@@ -161,7 +163,123 @@ Every tool returns a `dict` with a `status` field:
 {"status": "forbidden", ...}            # Access denied
 {"status": "queued", ...}               # Accepted background consolidation job
 {"status": "partial", ...}              # Durable progress exists; recovery required
+{"status": "conflict", ...}             # An operation on the same space is in progress; retry later
 ```
+
+### Guidance error payload
+
+A refused call (a result whose `status` is `error` or `forbidden`) keeps
+`status` and `message` and adds two fields: `error_kind`, one value from the
+closed set below, and `remediation`, an object that names the next step. The
+optional top-level fields `required_permission`, `current_permissions`,
+`accessible_spaces` and `existing_job` are present only when they apply.
+
+```json
+{
+  "status": "error",
+  "message": "Access denied to space 'q'",
+  "error_kind": "space_access_denied",
+  "accessible_spaces": ["p"],
+  "remediation": {
+    "next_tool": "space_list",
+    "reason": "The token has no access to space 'q'. Call space_list to view the spaces it can access, then retry with one of them.",
+    "retryable": true
+  }
+}
+```
+
+The `remediation` object carries `reason` (one sentence) and `retryable`
+(whether the same call may be retried after the step) and, when known,
+`next_tool` (a registered tool the token may call), `arguments` (values to
+pass, server-owned), `missing_arguments` (the argument names that were
+missing or invalid) and `required_prior_step` (a tool name or a fixed
+phrase such as "refresh the tool list"). Every sentence is built from
+server-owned text, tool names, argument names, permission names and the
+token's own space identifiers; exception text never enters it.
+
+The closed set of `error_kind` values, with one example each:
+
+- `authentication_missing`: no token identity reached the guard. Example:
+  `{"status": "error", "message": "Authentication required", "error_kind":
+  "authentication_missing", "remediation": {"reason": "Send a bearer token in
+  the Authorization header; an operator issues tokens with token_create.",
+  "retryable": true}}`.
+- `token_scope_changed`: an operator re-scoped or revoked the token during
+  the session. Example: `message` "Authentication required" with
+  `remediation.required_prior_step` "refresh the tool list" and
+  `retryable` true, consistent with `mcp_reconnect_required`.
+- `invalid_space_id`: a malformed or reserved space identifier. Example:
+  `message` "Invalid space identifier: 'Bad Id'" with
+  `remediation.missing_arguments` `["space_id"]` and a `reason` that gives
+  the format and the example `'project-alpha'`; for a reserved identifier the
+  reason gives the format only and does not say whether the space exists.
+- `space_access_denied`: the space is outside the token's allowlist. Example:
+  the payload above, with `accessible_spaces` (`[]` for a fresh token, whose
+  `reason` names `space_invite_token` and `system_whoami`).
+- `permission_insufficient`: the token lacks `write`, `manage` or `admin`.
+  Example: `message` "The 'manage' permission is required for this
+  operation", `required_permission` `"manage"`, `current_permissions`
+  `["read", "write"]`, `remediation.reason` "This token holds read, write. An
+  operator with manage or admin must perform this action or issue a token
+  with manage." and `retryable` false; no `next_tool` and no bypass.
+- `missing_argument`: a required argument or confirmation flag is absent.
+  Example: `message` "Deletion refused: confirm=True is required. This
+  operation cannot be undone." with `remediation.missing_arguments`
+  `["confirm"]` and `remediation.arguments` `{"confirm": true}`. The same
+  kind reports an argument absent from the call itself, with `message`
+  "Invalid arguments for <tool>: <field names>".
+- `invalid_argument`: an argument is outside its allowed values or format.
+  Example: `message` "Invalid category: 'note'. Valid values: observation,
+  decision, todo, insight, question, progress, issue" with
+  `remediation.reason` "category must be one of observation, decision, todo,
+  insight, question, progress, issue, for example 'observation'.".
+- `required_prior_step_missing`: a prior call or operator action has not
+  happened. No tool produces it yet; it is reserved. Example shape:
+  `remediation.required_prior_step` and `next_tool` naming the prior tool.
+- `operation_in_progress`: an operation on the same space is queued or
+  running. Example: the `conflict` result of `bank_compact`, `message`
+  "Consolidation is in progress for 'p'. Try again in a few minutes." with
+  `remediation.retryable` true; a `conflict` result is not a refusal and is
+  delivered as a successful result.
+- `write_route_refused`: the space is shared, in recovery, or its critical
+  state is corrupt. Example: `short_note` on a shared space returns `message`
+  "Writes to a shared space are not accepted on this route" with a `reason`
+  that names the operator workflow and `retryable` false; never "Internal
+  server error" and never a fallback route.
+- `internal_failure`: an unexpected exception rendered by `safe_error`.
+  Example: `message` "Internal server error" with `remediation.reason` "The
+  server logged the failure under the request identifier; report it to an
+  operator." and `retryable` false.
+- `operator_tools_refused`: the token is not allowed operator tools (see
+  "Operator tool guard" above). Example: `status` `forbidden`, the operator
+  message, `remediation.reason` "An operator performs this action through the
+  admin console or the CLI with an operator token." and `retryable` false.
+- `audience_unresolved`: a registered tool with no registry entry, which
+  startup validation makes unreachable in a served registry. Example: the
+  same `forbidden` payload as `operator_tools_refused` with this kind.
+- `unclassified_refusal`: a refusal that reached the conversion point without
+  `error_kind`; a defect indicator, never a designed outcome. Example:
+  `remediation.reason` "This refusal has no classification; report it to an
+  operator." with `retryable` false.
+
+On the MCP transport a refused call is delivered as an MCP error result
+(`isError: true`) that carries the payload twice: as `structuredContent` and
+as the same JSON in the text item of `content`. Every other result keeps the
+SDK's conversion (one text item, no `structuredContent`). The startup
+setting `MCP_REFUSAL_IS_ERROR` (default `true`) restores the 1.6.1 delivery
+(`isError: false` with the same payload) for now; a later release removes
+the setting (see `docs/DEPLOYMENT.md`). The `/api/tool` proxy returns the
+payload unchanged as an HTTP 200 JSON body.
+
+`bank_compact` failures carry the same `remediation` object: the former
+top-level string is now `remediation.reason` (the CLI shows it under
+"remediation:"), next to `failure_reason`, `failed_phase`,
+`rollback_outcome` and `failures`.
+
+Every refusal is audited (`tool` and `error_kind` on the `request` audit
+entry) and counted (`livemem_tool_refusals_total{tool,error_kind}` on
+`/metrics`); no argument value, remediation text, space identifier or token
+enters either.
 
 ### Permissions
 

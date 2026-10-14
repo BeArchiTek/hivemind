@@ -43,47 +43,38 @@ def register(mcp: MCPServer) -> int:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=False))
     async def live_note(
-        space_id: Annotated[str, Field(description="Target space identifier")],
+        space_id: Annotated[str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")],
         category: Annotated[
             str,
             Field(
-                description="Note category: observation|decision|todo|insight|question|progress|issue"
+                description="Note category, one of observation|decision|todo|insight|question|progress|issue, for example 'observation'"
             ),
         ],
-        content: Annotated[str, Field(description="Free-form note content")],
+        content: Annotated[str, Field(description="Free-form note content, for example 'The build passes after the dependency update'")],
         tags: Annotated[
             str,
             Field(
                 default="",
-                description="Comma-separated tags, for example 'auth,security,urgent'",
+                description="Comma-separated tags, for example 'auth,security,urgent'. Default: empty, no tag",
             ),
         ] = "",
     ) -> dict:
-        """
-        Append a note to a space's short-term memory.
-
-        This is the primary write tool for agents during active work. Each note
-        is stored as a unique append-only object so concurrent writers do not
-        overwrite one another.
-
-        The agent identity always comes from the authenticated credential's
-        ``client_name``. Callers cannot supply a different agent identity.
-
-        Args:
-            space_id: Target space.
-            category: observation|decision|todo|insight|question|progress|issue
-            content: Free-form note content.
-            tags: Optional comma-separated tags.
-
-        Returns:
-            Created object name, size, and timestamp.
+        """Append one atomic note to the short-term memory of a space.
+        Canonical name: short_note (also registered as live_note).
+        Use when: during work, for each durable fact, in one of the seven categories observation, decision, todo, insight, question, progress and issue; and once at the end of a work block for the summary note.
+        Do not use when: the fact is transient or already in the bank. mid_write is not an alternative for agents: it is an operator tool that bypasses consolidation, and agents never write the bank directly.
+        Before calling: permission write; access to space_id; space_rules, mid_read_all and short_read first.
+        Peer tools: short_read (before), mid_consolidate (after, at most once per work block).
+        Result: the note is stored; the agent identity comes from the token and is never passed as an argument. Never put tokens, endpoints or secrets in a note.
         """
         from ..auth.context import check_access, check_write_permission
-        from ..core.engines import get_engine_registry
+        from ..core.engines import RegistryRefused, get_engine_registry
+        from ..core.hivemind.models import CorruptedStateError
         from ..core.write_sink import (
             DirectLocalWriteSink,
             StagedWriteNotImplemented,
         )
+        from .guidance import write_route_refused
 
         try:
             # Vérifier accès à l'espace + permission write
@@ -127,6 +118,27 @@ def register(mcp: MCPServer) -> int:
                 content=content,
                 tags=tags,
             )
+        except StagedWriteNotImplemented:
+            # Specification 001, FR-008: a shared (staged) space refuses the
+            # write with server-owned text, never "Internal server error".
+            return write_route_refused(
+                "Writes to a shared space are not accepted on this route",
+                "The space is shared; an operator applies the staged write "
+                "workflow described in the deployment guide. Do not retry on "
+                "another route.",
+            )
+        except RegistryRefused:
+            return write_route_refused(
+                "Writes are refused while the space is in recovery",
+                "An operator resolves the space's recovery state (resync or "
+                "re-import) before writes resume. Do not retry on another route.",
+            )
+        except CorruptedStateError:
+            return write_route_refused(
+                "Writes are refused because the space's critical state is corrupt",
+                "An operator repairs or resyncs the space's critical state "
+                "before writes resume. Do not retry on another route.",
+            )
         except Exception as e:
             from ..auth.context import safe_error
 
@@ -134,46 +146,38 @@ def register(mcp: MCPServer) -> int:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def live_read(
-        space_id: Annotated[str, Field(description="Target space identifier")],
+        space_id: Annotated[str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")],
         limit: Annotated[
             int,
             Field(
-                default=50, description="Maximum number of notes to return (default: 50)"
+                default=50, description='Maximum number of notes to return, between 1 and 500. Default: 50'
             ),
         ] = 50,
         category: Annotated[
             str,
             Field(
                 default="",
-                description="Filter by category: observation|decision|todo|insight|question|progress|issue",
+                description='Filter by category, one of observation|decision|todo|insight|question|progress|issue. Default: empty, no filter',
             ),
         ] = "",
         agent: Annotated[
-            str, Field(default="", description="Filter by agent identifier")
+            str, Field(default="", description="Filter by agent identifier (the client_name of the token that wrote the note), for example 'agent-cline'. Default: empty, no filter")
         ] = "",
         since: Annotated[
             str,
             Field(
                 default="",
-                description="Return notes after this ISO 8601 timestamp, for example '2026-03-08T10:00:00'",
+                description="Return notes after this ISO 8601 timestamp, for example '2026-03-08T10:00:00'. Default: empty, no lower bound",
             ),
         ] = "",
     ) -> dict:
-        """
-        Read recent short-term notes from a space.
-
-        Supports optional category, agent, and timestamp filters. Notes are
-        returned from newest to oldest.
-
-        Args:
-            space_id: Target space.
-            limit: Maximum number of notes.
-            category: Optional category filter.
-            agent: Optional agent filter.
-            since: Optional ISO 8601 lower bound.
-
-        Returns:
-            Matching notes with metadata and content.
+        """Read the recent short-term notes of a space, newest first.
+        Canonical name: short_read (also registered as live_read).
+        Use when: at the start of every task, as the third start-of-task call, and to view what other agents noted since the last consolidation.
+        Do not use when: the agent searches for a text (call short_search) or needs the consolidated bank (call mid_read_all).
+        Before calling: permission read; access to space_id; space_rules and mid_read_all first.
+        Peer tools: space_rules and mid_read_all (before), short_note (after, to add notes).
+        Result: read the notes as recent unconsolidated facts; if the call fails, stop before any mutation.
         """
         from ..auth.context import check_access
         from ..core.live import get_live_service
@@ -197,27 +201,21 @@ def register(mcp: MCPServer) -> int:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def live_search(
-        space_id: Annotated[str, Field(description="Target space identifier")],
+        space_id: Annotated[str, Field(description="Space identifier: letters, digits, hyphens and underscores, at most 64 characters, for example 'project-alpha'")],
         query: Annotated[
-            str, Field(description="Case-insensitive text to find in note content")
+            str, Field(description="Case-insensitive text to find in note content, for example 'timeout'")
         ],
         limit: Annotated[
-            int, Field(default=20, description="Maximum number of results (default: 20)")
+            int, Field(default=20, description='Maximum number of results, between 1 and 500. Default: 20')
         ] = 20,
     ) -> dict:
-        """
-        Search a space's short-term notes by text.
-
-        Searches note content case-insensitively and returns matches from newest
-        to oldest.
-
-        Args:
-            space_id: Target space.
-            query: Text to search for.
-            limit: Maximum number of results.
-
-        Returns:
-            Notes whose content matches the query.
+        """Search the short-term notes of a space by text, newest first.
+        Canonical name: short_search (also registered as live_search).
+        Use when: the agent looks for a specific fact, decision or issue among recent notes.
+        Do not use when: the agent needs the latest notes without a filter (call short_read) or historical context (call long_query).
+        Before calling: permission read; access to space_id; no prior call.
+        Peer tools: short_read (recent notes), long_query (historical context).
+        Result: read the matching notes; verify important facts against the repository files.
         """
         from ..auth.context import check_access
         from ..core.live import get_live_service

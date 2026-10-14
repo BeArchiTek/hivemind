@@ -86,24 +86,43 @@ class LiveService:
             {"status": "created", "filename": "...", ...}
         """
         # VULN-07 fix : valider la taille du contenu
+        from ..tools.guidance import ErrorKind, refusal, remediation
+
         if len(content) > MAX_NOTE_CONTENT_SIZE:
-            return {
-                "status": "error",
-                "message": (
+            return refusal(
+                (
                     f"Content too long ({len(content)} characters, "
                     f"maximum {MAX_NOTE_CONTENT_SIZE})"
                 ),
-            }
+                ErrorKind.INVALID_ARGUMENT,
+                remediation=remediation(
+                    reason=(
+                        f"content must be at most {MAX_NOTE_CONTENT_SIZE} "
+                        "characters; split the note into several short notes, "
+                        "for example one note per decision."
+                    ),
+                    retryable=True,
+                    missing_arguments=["content"],
+                ),
+            )
 
         # Valider la catégorie
         if category not in VALID_CATEGORIES:
-            return {
-                "status": "error",
-                "message": (
+            return refusal(
+                (
                     f"Invalid category: '{category}'. "
                     f"Valid values: {', '.join(VALID_CATEGORIES)}"
                 ),
-            }
+                ErrorKind.INVALID_ARGUMENT,
+                remediation=remediation(
+                    reason=(
+                        f"category must be one of {', '.join(VALID_CATEGORIES)}, "
+                        f"for example '{VALID_CATEGORIES[0]}'."
+                    ),
+                    retryable=True,
+                    missing_arguments=["category"],
+                ),
+            )
 
         storage = get_storage()
 
@@ -119,10 +138,11 @@ class LiveService:
 
         agent = get_current_agent_name()
         if not isinstance(agent, str) or agent == "":
-            return {
-                "status": "error",
-                "message": "A non-empty client_name identity is required to write a note",
-            }
+            from ..auth.context import client_name_missing
+
+            return client_name_missing(
+                "A non-empty client_name identity is required to write a note"
+            )
 
         # Construire le nom de fichier unique
         # Format : {YYYYMMDD}T{HHMMSS}_{agent}_{category}_{uuid8}.md
