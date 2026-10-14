@@ -3680,6 +3680,9 @@ def _create_app(*, debug: bool = False):
     base_app = mcp.streamable_http_app(
         host=settings.mcp_server_host,
         max_request_body_size=settings.mcp_request_max_bytes,
+        # SDK 2 session limits, explicit rather than implicit (F5).
+        max_sessions=settings.mcp_max_sessions,
+        session_idle_timeout=settings.mcp_session_idle_timeout_seconds,
     )
     app = StaticFilesMiddleware(base_app)
     app = LoggingMiddleware(app, debug=debug)

@@ -275,7 +275,8 @@ def create_app():
 
     Pile d'exécution (premier exécuté → dernier) :
         RequestId → Auth → Metrics → Audit → Logging → MCPRequestLimit → ResponseLimit
-        → [Mesh namespace, si activé] → StaticFiles → MCP Streamable HTTP
+        → [Mesh namespace, si activé] → StaticFiles
+        → MCP Streamable HTTP (app SDK, avec MCPSessionLimit en tête)
 
     Le RequestIdMiddleware génère un ID unique par requête (contextvars).
     Le MetricsMiddleware expose /metrics et collecte les compteurs.
@@ -283,7 +284,8 @@ def create_app():
     L'AuditMiddleware émet des entrées d'audit JSON structurées.
     Le LoggingMiddleware trace les requêtes HTTP en JSON sur stderr.
     Le ResponseLimitMiddleware tronque les réponses > 512 KB (MCP exclu).
-    Le MCPRequestLimitMiddleware borne le body avant le buffering du SDK.
+    Le MCPRequestLimitMiddleware refuse un Content-Length hors budget avant le SDK.
+    Le MCPSessionLimitMiddleware plafonne les sessions MCP ouvertes par token.
     Le StaticFilesMiddleware sert /live, /static/*, /api/* (interface web).
     """
     # HM-01 fix : rejeter une ADMIN_BOOTSTRAP_KEY par défaut/faible ICI, dans la
@@ -314,6 +316,7 @@ def create_app():
         RequestIdMiddleware,
         MetricsMiddleware,
         MCPRequestLimitMiddleware,
+        MCPSessionLimitMiddleware,
         ResponseLimitMiddleware,
         AuditMiddleware,
     )
@@ -449,7 +452,45 @@ def create_app():
     app = mcp.streamable_http_app(
         host=settings.mcp_server_host,
         max_request_body_size=settings.mcp_request_max_bytes,
+        # SDK 2 session limits, explicit rather than implicit (F5).
+        max_sessions=settings.mcp_max_sessions,
+        session_idle_timeout=settings.mcp_session_idle_timeout_seconds,
     )
+
+    # Per-bearer-token session cap, installed INSIDE the SDK's Starlette app
+    # (its outermost Starlette middleware) so it is part of the MCP app
+    # itself, whatever wraps it. The SDK (pinned 2.3.0) keeps its live
+    # stateful sessions in the session manager's private registry; reading
+    # it is what lets a DELETE, an idle expiry or a server-side drop free the
+    # token's slot without a second bookkeeping path. The registry is checked
+    # once here, at build time: a missing registry would otherwise make the
+    # cap silently count zero sessions (fail-open), so it fails the startup.
+    def _session_registry():
+        manager = getattr(getattr(mcp, "_lowlevel_server", None), "_session_manager", None)
+        return getattr(manager, "_server_instances", None)
+
+    def _open_mcp_sessions():
+        registry = _session_registry()
+        return registry.keys() if isinstance(registry, dict) else ()
+
+    if hasattr(app, "add_middleware"):
+        if settings.mcp_max_sessions_per_bearer_token > 0 and not isinstance(
+            _session_registry(), dict
+        ):
+            raise RuntimeError(
+                "MCP SDK session registry not found: the per-bearer-token session "
+                "cap cannot be enforced with this mcp version (expected 2.3.0); "
+                "set MCP_MAX_SESSIONS_PER_BEARER_TOKEN=0 to run without it"
+            )
+        app.add_middleware(
+            MCPSessionLimitMiddleware,
+            max_sessions_per_bearer_token=settings.mcp_max_sessions_per_bearer_token,
+            open_sessions=_open_mcp_sessions,
+        )
+    else:
+        # A substituted inner app (test doubles) is not the SDK app: nothing
+        # to cap, and no session registry to read.
+        logger.warning("MCP app is not the SDK Starlette app: per-bearer-token session cap not installed")
 
     # Empiler les middlewares (dernier ajouté = premier exécuté)
     # Ordre : RequestId → Auth → Metrics → Audit → Logging → MCPRequestLimit → ResponseLimit → Static → MCP

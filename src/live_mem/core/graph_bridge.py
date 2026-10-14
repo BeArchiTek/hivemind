@@ -37,6 +37,7 @@ import hashlib
 import asyncio
 import logging
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Callable, Optional, Any
 
@@ -53,6 +54,26 @@ from .url_guard import validate_gm_url
 from .reservation_guard import assert_space_not_reserved
 
 logger = logging.getLogger("live_mem.graph_bridge")
+
+# F2 (SDK 2) : clé métier des copies bank-mirror dans Graph Memory.
+# ``memory_ingest_async`` exige un ``source_path`` ; ce schéma distinctif ne
+# peut pas entrer en collision avec le ``source_path`` d'un document canonique
+# P4-7 (chemin opérateur) et identifie positivement une copie mirror de CE
+# space. Les copies historiques (``source_path`` nul) restent reconnues.
+BANK_MIRROR_SOURCE_SCHEME = "hivemind-bank-mirror://"
+
+
+def bank_mirror_source_path(space_id: str, relpath: str) -> str:
+    """``source_path`` GM d'une copie bank-mirror (clé métier stable)."""
+    return f"{BANK_MIRROR_SOURCE_SCHEME}{space_id}/{relpath}"
+
+
+def bank_mirror_relpath(space_id: str, source_path: object) -> Optional[str]:
+    """Relpath bank d'un ``source_path`` mirror de ce space, sinon ``None``."""
+    prefix = f"{BANK_MIRROR_SOURCE_SCHEME}{space_id}/"
+    if isinstance(source_path, str) and source_path.startswith(prefix):
+        return source_path[len(prefix):] or None
+    return None
 
 
 async def _finish_local_mutation(operation):
@@ -611,6 +632,43 @@ class GraphMemoryClient:
     def _mcp_url(self) -> str:
         return f"{self._base_url}/mcp"
 
+    @asynccontextmanager
+    async def _open_session(self):
+        """Ouvre une session MCP auto-contenue (transport → session → initialize).
+
+        Une seule échéance client par appel d'outil : ``asyncio.wait_for`` dans
+        ``_invoke``. La session SDK ne porte PAS de ``read_timeout_seconds`` —
+        en SDK 2 c'est un second compte à rebours qui envoie
+        ``notifications/cancelled`` et fait avorter l'outil côté serveur.
+        """
+        async with httpx2.AsyncClient(
+            headers=self._headers, timeout=self._timeout, trust_env=False,
+            # Honor operator CA settings without enabling environment proxies.
+            verify=httpx2.create_ssl_context(trust_env=True),
+        ) as http_client, streamable_http_client(
+            self._mcp_url, http_client=http_client,
+            # SDK 1 allowed large backup/export responses; only requests are size-bounded.
+            max_sse_event_size=None,
+        ) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
+
+    async def _invoke(self, session, tool_name: str, arguments: dict) -> dict:
+        """Appelle un outil sur une session ouverte et extrait le résultat."""
+        result = await asyncio.wait_for(
+            session.call_tool(tool_name, arguments),
+            timeout=self._timeout,
+        )
+        # Extraire le résultat (SDK MCP encapsule dans content[0].text)
+        if result.content and len(result.content) > 0:
+            text = result.content[0].text
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                return {"status": "ok", "raw": text}
+        return {"status": "ok", "raw": ""}
+
     async def call_tool(self, tool_name: str, arguments: dict) -> dict:
         """
         Appelle un outil MCP sur Graph Memory (session auto-contenue).
@@ -626,34 +684,8 @@ class GraphMemoryClient:
             Résultat de l'outil (dict)
         """
         try:
-            async with httpx2.AsyncClient(
-                headers=self._headers, timeout=self._timeout, trust_env=False,
-                # Honor operator CA settings without enabling environment proxies.
-                verify=httpx2.create_ssl_context(trust_env=True),
-            ) as http_client, streamable_http_client(
-                self._mcp_url, http_client=http_client,
-                # SDK 1 allowed large backup/export responses; only requests are size-bounded.
-                max_sse_event_size=None,
-            ) as (read, write):
-                async with ClientSession(
-                    read, write, read_timeout_seconds=self._timeout,
-                ) as session:
-                    await session.initialize()
-
-                    result = await asyncio.wait_for(
-                        session.call_tool(tool_name, arguments),
-                        timeout=self._timeout,
-                    )
-
-                    # Extraire le résultat (SDK MCP encapsule dans content[0].text)
-                    if result.content and len(result.content) > 0:
-                        text = result.content[0].text
-                        try:
-                            return json.loads(text)
-                        except (json.JSONDecodeError, TypeError):
-                            return {"status": "ok", "raw": text}
-
-                    return {"status": "ok", "raw": ""}
+            async with self._open_session() as session:
+                return await self._invoke(session, tool_name, arguments)
 
         except asyncio.TimeoutError:
             raise TimeoutError(
@@ -677,48 +709,24 @@ class GraphMemoryClient:
         """
         results = []
         try:
-            async with httpx2.AsyncClient(
-                headers=self._headers, timeout=self._timeout, trust_env=False,
-                # Honor operator CA settings without enabling environment proxies.
-                verify=httpx2.create_ssl_context(trust_env=True),
-            ) as http_client, streamable_http_client(
-                self._mcp_url, http_client=http_client,
-                # SDK 1 allowed large backup/export responses; only requests are size-bounded.
-                max_sse_event_size=None,
-            ) as (read, write):
-                async with ClientSession(
-                    read, write, read_timeout_seconds=self._timeout,
-                ) as session:
-                    await session.initialize()
-
-                    for tool_name, arguments in calls:
-                        try:
-                            result = await asyncio.wait_for(
-                                session.call_tool(tool_name, arguments),
-                                timeout=self._timeout,
-                            )
-                            if result.content and len(result.content) > 0:
-                                text = result.content[0].text
-                                try:
-                                    results.append(json.loads(text))
-                                except (json.JSONDecodeError, TypeError):
-                                    results.append({"status": "ok", "raw": text})
-                            else:
-                                results.append({"status": "ok", "raw": ""})
-                        except asyncio.TimeoutError:
-                            results.append(
-                                {
-                                    "status": "error",
-                                    "message": f"Timed out after {self._timeout}s running '{tool_name}'",
-                                }
-                            )
-                        except Exception as e:
-                            results.append(
-                                {
-                                    "status": "error",
-                                    "message": f"'{tool_name}' error: {e}",
-                                }
-                            )
+            async with self._open_session() as session:
+                for tool_name, arguments in calls:
+                    try:
+                        results.append(await self._invoke(session, tool_name, arguments))
+                    except asyncio.TimeoutError:
+                        results.append(
+                            {
+                                "status": "error",
+                                "message": f"Timed out after {self._timeout}s running '{tool_name}'",
+                            }
+                        )
+                    except Exception as e:
+                        results.append(
+                            {
+                                "status": "error",
+                                "message": f"'{tool_name}' error: {e}",
+                            }
+                        )
 
         except Exception as e:
             # Si la connexion elle-même échoue, remplir tous les résultats manquants
@@ -773,6 +781,11 @@ class GraphBridgeService:
         # un lambda) : zéro frame intermédiaire, la preuve byte-for-byte tient.
         self._client_factory = client_factory or GraphMemoryClient
         self._url_validator = url_validator or validate_gm_url
+        # F2 : budget d'attente par job d'ingestion asynchrone soumis par le
+        # push (cumulé : N jobs → N × budget, l'ancien pire cas synchrone) et
+        # intervalle entre deux sondages ``ingest_job_status``.
+        self.push_ingest_timeout_seconds = 180.0
+        self.push_poll_interval_seconds = 2.0
 
     def _make_client(self, url: str, token: str, **kwargs) -> "GraphMemoryClient":
         # Site unique de construction. La factory par défaut EST la classe
@@ -1426,11 +1439,17 @@ class GraphBridgeService:
         """
         Pousse les fichiers bank du space dans graph-memory.
 
-        Synchronisation intelligente (delete + re-ingest) :
+        Synchronisation (F2, SDK 2 : ingestion asynchrone) :
         1. Liste les documents existants dans graph-memory
-        2. Pour chaque fichier bank :
-           - Si existe dans graph-memory → delete puis re-ingest
-           - Sinon → ingest
+        2. Soumet chaque fichier bank via ``memory_ingest_async``
+           (clé métier ``hivemind-bank-mirror://<space>/<relpath>``,
+           ``replace_existing=True``) puis sonde ``ingest_job_status``
+           jusqu'à un état terminal ou l'épuisement du budget. Une copie
+           mirror existante n'est remplacée qu'une fois la nouvelle version
+           active (safe-replace côté GM) ; une copie historique
+           (``source_path`` nul) n'est supprimée qu'après ce succès. Un
+           fichier échoué ou encore en cours est reporté (``errors`` /
+           ``pending``) et repoussé au prochain push.
         3. Supprime les documents orphelins du namespace bank-mirror
            (nettoyage SCOPÉ : seuls les docs précédemment mirrorés ET sans
            ``source_path`` peuvent être supprimés — un doc canonique P4-7 ou
@@ -1447,8 +1466,8 @@ class GraphBridgeService:
         de tous les fichiers ; la garde de permission 'manage' + l'audit
         structuré vivent au tool layer (ADR-0010 : le bridge reste pass-through).
 
-        Utilise call_tools_batch() pour exécuter tous les appels
-        dans une seule session MCP (performance).
+        Utilise call_tools_batch() pour les soumissions, le nettoyage et
+        chaque tour de sondage (une session MCP par lot d'appels courts).
 
         Args:
             space_id: Identifiant du space live-memory
@@ -1458,7 +1477,8 @@ class GraphBridgeService:
 
         Returns:
             {"status": "ok", "pushed": N, "pushed_files": [...],
-             "skipped_volatile": [...], "cleaned_orphans": N, "errors": N, ...}
+             "skipped_volatile": [...], "cleaned_orphans": N, "errors": N,
+             "pending": N, "pending_files": [...], ...}
         """
         await assert_space_not_reserved(space_id)
         storage = get_storage()
@@ -1546,24 +1566,41 @@ class GraphBridgeService:
             # filename → [document_id, ...] depuis le ``document_list``, qui
             # expose ``id``, ``filename`` ET ``source_path`` (clé TOUJOURS
             # présente, ``None`` si absente — contrat homogène GM,
-            # core/graph.py). SEULS les docs SANS ``source_path`` sont des
-            # copies bank-mirror candidates à suppression : un doc canonique
-            # P4-7 porte un ``source_path`` et n'est JAMAIS supprimé, même
-            # s'il partage le filename d'un fichier bank. Une entrée mirror
-            # sans ``id`` résolvable reste visible dans ``existing_docs``
-            # mais n'est JAMAIS candidate (fail-closed : aucune destruction
-            # sans preuve positive d'identité).
+            # core/graph.py). Deux formes de copie mirror sont candidates :
+            #   - F2 : ``source_path`` au schéma ``hivemind-bank-mirror://``
+            #     de CE space (clé métier ; remplacée côté GM par le
+            #     safe-replace de ``memory_ingest_async``, jamais supprimée
+            #     avant que la nouvelle version soit active) ;
+            #   - historique : ``source_path`` nul (copie ``memory_ingest``
+            #     d'avant F2), supprimée par le client APRÈS le succès du
+            #     nouveau job seulement — le fichier n'est jamais absent de
+            #     LONG après un ingest échoué ou inachevé.
+            # Un doc canonique P4-7 porte un ``source_path`` opérateur et
+            # n'est JAMAIS supprimé, même s'il partage le filename d'un
+            # fichier bank. Une entrée mirror sans ``id`` résolvable reste
+            # visible dans ``existing_docs`` mais n'est JAMAIS candidate
+            # (fail-closed : aucune destruction sans preuve positive
+            # d'identité).
             existing_docs = set()
             mirror_ids_by_filename: dict[str, list[str]] = {}
+            legacy_ids_by_filename: dict[str, list[str]] = {}
             if doc_list.get("status") == "ok":
                 for doc in doc_list.get("documents", []):
                     fname = doc.get("filename", "")
-                    existing_docs.add(fname)
-                    if doc.get("source_path") is not None:
-                        continue  # canonique/archive : jamais candidat
                     doc_id = doc.get("id")
+                    source_path = doc.get("source_path")
+                    mirror_rel = bank_mirror_relpath(space_id, source_path)
+                    if mirror_rel is not None:
+                        existing_docs.add(mirror_rel)
+                        if doc_id:
+                            mirror_ids_by_filename.setdefault(mirror_rel, []).append(doc_id)
+                        continue
+                    existing_docs.add(fname)
+                    if source_path is not None:
+                        continue  # canonique/archive : jamais candidat
                     if doc_id:
                         mirror_ids_by_filename.setdefault(fname, []).append(doc_id)
+                        legacy_ids_by_filename.setdefault(fname, []).append(doc_id)
 
             logger.info(
                 "Push '%s' → '%s': %d bank files, %d existing documents",
@@ -1573,52 +1610,34 @@ class GraphBridgeService:
                 len(existing_docs),
             )
 
-            # 2. Construire le batch d'appels (delete + ingest pour chaque fichier)
+            # 2. Construire le batch de soumissions asynchrones (F2).
+            # ``memory_ingest_async`` + ``replace_existing=True`` : GM prépare
+            # la nouvelle version en double-buffering et ne purge l'ancienne
+            # copie mirror (même clé métier) qu'après activation. Aucun
+            # ``memory_ingest`` synchrone : un job lent n'est jamais annulé
+            # par une échéance client (chaque sondage est un appel court).
             calls = []
             call_metadata = []  # Pour tracker quel appel fait quoi
 
             for filename, content in bank_files.items():
-                # Si une copie MIRROR existe → supprimer d'abord. Le delete est
-                # keyé par ``document_id`` résolu depuis ``document_list``
-                # (P7-8), et restreint aux docs sans ``source_path`` : un doc
-                # canonique qui partage le filename n'est jamais touché.
-                # Plusieurs ids mirror pour un même filename = copies
-                # dupliquées (héritées du bug delete-par-filename) : toutes
-                # remplacées. Un doc présent (filename connu) mais sans id
-                # mirror résolvable → PAS de delete (fail-closed), l'ingest
-                # procède quand même (dupliquer est visible et réparable ;
-                # supprimer sans preuve d'identité ne l'est pas).
-                if filename in existing_docs:
-                    resolved_ids = mirror_ids_by_filename.get(filename, [])
-                    if not resolved_ids:
-                        logger.warning(
-                            "Document '%s' is present in GM without an "
-                            "identifiable mirror copy (null id + source_path) — "
-                            "skipping delete before re-ingestion (fail-closed)",
-                            filename,
-                        )
-                    for doc_id in resolved_ids:
-                        calls.append(
-                            (
-                                "document_delete",
-                                {
-                                    "memory_id": memory_id,
-                                    "document_id": doc_id,
-                                },
-                            )
-                        )
-                        call_metadata.append(("delete", filename))
-
-                # Encoder en base64 et ingérer
+                if filename in existing_docs and not mirror_ids_by_filename.get(filename):
+                    logger.warning(
+                        "Document '%s' is present in GM without an "
+                        "identifiable mirror copy (null id + source_path) — "
+                        "re-ingesting without deleting it (fail-closed)",
+                        filename,
+                    )
                 content_bytes = content.encode("utf-8")
-                content_b64 = base64.b64encode(content_bytes).decode("ascii")
                 calls.append(
                     (
-                        "memory_ingest",
+                        "memory_ingest_async",
                         {
                             "memory_id": memory_id,
-                            "content_base64": content_b64,
+                            "content_base64": base64.b64encode(content_bytes).decode("ascii"),
                             "filename": filename,
+                            "source_path": bank_mirror_source_path(space_id, filename),
+                            "sha256": hashlib.sha256(content_bytes).hexdigest(),
+                            "replace_existing": True,
                         },
                     )
                 )
@@ -1631,12 +1650,12 @@ class GraphBridgeService:
             # (a) était dans le set bank-mirror PRÉCÉDEMMENT enregistré
             # (ledger ``bank_mirror`` du bloc local graph_memory) ET est
             # absent de la bank courante, ET (b) est identifié côté GM comme
-            # copie mirror (``source_path`` nul + ``id`` résolu, cf. la map
-            # ci-dessus — P7-8). Les docs canoniques (P4-7, ``source_path``
-            # non nul) ne sont ni dans le ledger ni dans la map : jamais
-            # candidats. Le complément naïf ``existing_docs -
-            # bank_files.keys()`` est INTERDIT : il supprimerait des docs
-            # canoniques/archive.
+            # copie mirror (``source_path`` nul ou au schéma mirror de ce
+            # space, ``id`` résolu, cf. la map ci-dessus — P7-8). Les docs
+            # canoniques (P4-7, ``source_path`` opérateur) ne sont ni dans le
+            # ledger ni dans la map : jamais candidats. Le complément naïf
+            # ``existing_docs - bank_files.keys()`` est INTERDIT : il
+            # supprimerait des docs canoniques/archive.
             prior_mirror = set(gm_config.get("bank_mirror") or [])
             orphan_candidates = (prior_mirror & existing_docs) - set(bank_files.keys())
             # Garde-fou volatil : ne jamais évincer un volatil déjà présent dans
@@ -1678,47 +1697,110 @@ class GraphBridgeService:
             # 4. Exécuter tout le batch dans une seule session
             results = await gm.call_tools_batch(calls)
 
-            # 5. Analyser les résultats
+            # 5. Analyser les résultats des soumissions et du nettoyage
             pushed = 0
             pushed_files: list[str] = []
             deleted_before_reingest = 0
             cleaned = 0
             errors = 0
             error_details = []
+            pending_jobs: dict[str, str] = {}  # filename → job_id
+
+            def _ingest_failed(filename: str, message: str) -> None:
+                nonlocal errors
+                errors += 1
+                error_details.append({"filename": filename, "error": message})
+                logger.error("ingest failed for '%s': %s", filename, message)
 
             for (action, filename), result in zip(call_metadata, results):
-                if result.get("status") == "error":
-                    if action == "ingest":
-                        errors += 1
-                        error_details.append(
-                            {
-                                "filename": filename,
-                                "error": result.get("message", ""),
-                            }
+                status = result.get("status")
+                if action == "clean":
+                    if status == "error":
+                        logger.warning(
+                            "%s failed for '%s': %s", action, filename, result.get("message", ""),
                         )
-                        logger.error(
-                            "%s failed for '%s': %s",
-                            action,
-                            filename,
+                    else:
+                        cleaned += 1
+                        logger.info("Cleaned orphan '%s'", filename)
+                    continue
+                # Soumission asynchrone : réponse immédiate GM.
+                job_id = result.get("job_id")
+                if status in ("queued", "running") and job_id:
+                    pending_jobs[filename] = str(job_id)
+                elif status in ("skipped", "succeeded"):
+                    # Même clé métier + même checksum déjà actifs : à jour.
+                    pushed += 1
+                    pushed_files.append(filename)
+                    logger.info("Ingested '%s' (already current)", filename)
+                else:
+                    _ingest_failed(filename, result.get("message", str(status)))
+
+            # 6. Sondage des jobs jusqu'à un état terminal ou l'épuisement du
+            #    budget. Chaque sondage est un appel court ; le job continue
+            #    côté GM quoi qu'il arrive au client.
+            deadline = time.monotonic() + self.push_ingest_timeout_seconds * len(pending_jobs)
+            while pending_jobs:
+                polled = list(pending_jobs.items())
+                statuses = await gm.call_tools_batch(
+                    [
+                        (
+                            "ingest_job_status",
+                            {"job_id": job_id, "expected_memory_id": memory_id},
+                        )
+                        for _, job_id in polled
+                    ]
+                )
+                for (filename, job_id), state in zip(polled, statuses):
+                    status = state.get("status")
+                    if status in ("succeeded", "skipped"):
+                        pending_jobs.pop(filename, None)
+                        pushed += 1
+                        pushed_files.append(filename)
+                        logger.info("Ingested '%s' (job %s)", filename, job_id)
+                    elif status in ("failed", "cancelled", "changed_skipped", "not_found"):
+                        pending_jobs.pop(filename, None)
+                        detail = state.get("error") or state.get("message") or status
+                        _ingest_failed(filename, f"job {job_id} {status}: {detail}")
+                    # queued / running / erreur transitoire de sondage : on
+                    # continue jusqu'au budget.
+                if not pending_jobs or time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(self.push_poll_interval_seconds)
+
+            # 7. Copies historiques (``source_path`` nul) : supprimées
+            #    SEULEMENT pour les fichiers dont la nouvelle version est
+            #    active. Un fichier échoué/en attente garde son ancienne
+            #    copie et sera repoussé au prochain push.
+            legacy_deletes = []
+            for filename in pushed_files:
+                for doc_id in legacy_ids_by_filename.get(filename, []):
+                    legacy_deletes.append(
+                        (
+                            "document_delete",
+                            {"memory_id": memory_id, "document_id": doc_id},
+                        )
+                    )
+            if legacy_deletes:
+                for (_, args), result in zip(
+                    legacy_deletes, await gm.call_tools_batch(legacy_deletes)
+                ):
+                    if result.get("status") == "error":
+                        logger.warning(
+                            "legacy mirror delete failed for '%s': %s",
+                            args["document_id"],
                             result.get("message", ""),
                         )
                     else:
-                        logger.warning(
-                            "%s failed for '%s': %s",
-                            action,
-                            filename,
-                            result.get("message", ""),
-                        )
-                else:
-                    if action == "ingest":
-                        pushed += 1
-                        pushed_files.append(filename)
-                        logger.info("Ingested '%s'", filename)
-                    elif action == "delete":
                         deleted_before_reingest += 1
-                    elif action == "clean":
-                        cleaned += 1
-                        logger.info("Cleaned orphan '%s'", filename)
+
+            for filename, job_id in pending_jobs.items():
+                logger.warning(
+                    "Ingest job %s for '%s' did not finish within the push "
+                    "budget — still running on Graph Memory; the next push "
+                    "re-checks it",
+                    job_id,
+                    filename,
+                )
 
         except ConnectionError as e:
             return {
@@ -1796,14 +1878,22 @@ class GraphBridgeService:
             "pushed": pushed,
             "pushed_files": pushed_files,
             "skipped_volatile": skipped_volatile,
+            # Copies historiques (pré-F2) supprimées après activation de la
+            # nouvelle version ; nom conservé pour les lecteurs CLI/Portal.
             "deleted_before_reingest": deleted_before_reingest,
             "cleaned_orphans": cleaned,
             "errors": errors,
+            "pending": len(pending_jobs),
+            "pending_files": sorted(pending_jobs),
             "duration_seconds": duration,
         }
 
         if error_details:
             result["error_details"] = error_details
+        if pending_jobs:
+            result["pending_details"] = [
+                {"filename": f, "job_id": j} for f, j in sorted(pending_jobs.items())
+            ]
 
         logger.info(
             "Push completed '%s' → '%s': %d pushed, %d cleaned, %d errors (%.1fs)",

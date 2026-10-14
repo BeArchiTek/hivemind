@@ -15,7 +15,80 @@ linked guides when installing or upgrading.
 
 ## [Unreleased] — Hivemind public release
 
-No changes recorded yet.
+### Added
+
+- Explicit MCP session limits on both runtimes (SDK 2). `MCP_MAX_SESSIONS`
+  (default 10000) and `MCP_SESSION_IDLE_TIMEOUT_SECONDS` (default 1800) are
+  now passed to the SDK by the core server and the embedded Graph Memory
+  instead of being taken implicitly; a session with no request in flight for
+  30 minutes is closed and its id then answers 404. The core server also caps
+  the open sessions one bearer token (API credential) may hold: `MCP_MAX_SESSIONS_PER_BEARER_TOKEN` (default
+  100; 0 disables). While a bearer token is at its cap, a further `initialize`
+  receives HTTP 429 with a JSON-RPC error body; other bearer tokens are unaffected.
+  A session stops counting when the client ends it with `DELETE /mcp`, when
+  it expires idle, or when the server drops it. Documented in
+  `docs/DEPLOYMENT.md` and `.env.example`.
+
+### Changed
+
+- `graph_push` no longer runs the synchronous `memory_ingest` Graph Memory
+  tool under a client deadline. Each bank file is submitted with
+  `memory_ingest_async` (business key `hivemind-bank-mirror://<space>/<relpath>`,
+  `replace_existing=true`) and `ingest_job_status` is polled with short calls
+  until a terminal state or the push wait budget runs out. Graph Memory keeps
+  the previous mirror copy active until the new version is promoted, and a
+  pre-existing copy without `source_path` is deleted only after the new job
+  succeeded, so a failed or unfinished ingest never leaves the file missing
+  from LONG. Such a file is reported in `errors` / `pending` (with its
+  `job_id`) and is retried by the next push. The result keeps its existing
+  keys and adds `pending`, `pending_files` and `pending_details`.
+- The core `MCPRequestLimitMiddleware` no longer buffers `/mcp` request bodies.
+  It still refuses an oversized `Content-Length` with 413 before reading any
+  byte; a chunked body without `Content-Length` that exceeds
+  `MCP_REQUEST_MAX_BYTES` is refused with 413 by the SDK's own limit, which is
+  configured with the same budget. Request bodies were previously buffered
+  twice, doubling peak memory per request.
+
+### Fixed
+
+- The Python CLI no longer sets a per-request deadline on its MCP session. In
+  SDK 2 that deadline sent `notifications/cancelled` when it expired, which
+  aborted long tools on the server (`bank compact --apply`, `graph push`,
+  `backup restore`). The HTTP idle read timeout of the CLI's transport is
+  unchanged, so a stream that stays active completes.
+- Graph Memory's ingest pipeline now rolls back (S3 object, candidate Document
+  node, vectors) when the task running it is cancelled, which SDK 2 does when
+  the client disconnects or sends `notifications/cancelled`. The rollback is
+  shielded from the cancellation and runs to completion; the cancellation
+  then propagates. Behavior for `IngestCancelled` and ordinary exceptions is
+  unchanged.
+- `backup_restore` completes its copy phase even when the request is
+  cancelled, then propagates the cancellation: the target space is never left
+  half-copied so that a retry is refused with "already exists". The rollback of
+  a cancelled `bank_compact --apply` is itself never cancelled: the bank ends
+  fully compacted or fully rolled back, without a `recovery_required` /
+  `compaction_rollback_cancelled` state caused by the cancellation alone.
+  A rollback that completed while the cancellation was being re-delivered
+  (anyio re-delivers it at every checkpoint) is reported with its real outcome
+  on the propagated cancellation, not as `compaction_rollback_cancelled`. When
+  the protected phase itself fails while a cancellation is pending, the
+  cancellation still propagates (with the failure as its cause) instead of
+  being replaced by the failure.
+- The core server refuses to start when the SDK no longer exposes the session
+  registry the per-bearer-token cap reads, unless
+  `MCP_MAX_SESSIONS_PER_BEARER_TOKEN=0`; the cap can no longer fail open
+  silently after an SDK upgrade.
+
+### Tests
+
+- The shared `FakeGraphTransport` answers `memory_ingest_async` and
+  `ingest_job_status` like the real Graph Memory tools; push suites assert the
+  asynchronous tool names. The request-budget suite now pins the streaming
+  pass-through and the SDK-side 413 instead of the removed double buffering.
+
+Hivemind OSS is strictly mono-tenant; `space_id` allowlist is NOT a tenant
+boundary. The per-bearer-token MCP session cap bounds one credential's open
+sessions in a single-tenant deployment; it is not a tenant boundary either.
 
 ---
 

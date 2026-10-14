@@ -437,11 +437,15 @@ async def test_push_byte_for_byte() -> None:
     # document_list issued first via call_tool, then the batch.
     assert names[0] == "document_list"
     assert inst.calls[0].via == "call_tool"
-    # batch: delete(systemPatterns) + ingest(systemPatterns) + clean orphan
-    # (stale.md). Order of bank files preserved.
+    # F2: async submit(systemPatterns) + clean orphan (stale.md), one status
+    # poll, then the legacy mirror copy of systemPatterns is deleted only
+    # AFTER the new version succeeded. Order of bank files preserved.
     batch_names = names[1:]
-    assert batch_names.count("memory_ingest") == 1  # only the durable file
-    assert batch_names.count("document_delete") == 2  # 1 re-ingest delete + 1 orphan
+    assert batch_names.count("memory_ingest_async") == 1  # only the durable file
+    assert "memory_ingest" not in batch_names  # never the synchronous tool
+    assert batch_names.count("document_delete") == 2  # 1 legacy copy + 1 orphan
+    assert batch_names.index("ingest_job_status") < len(batch_names) - 1
+    assert batch_names[-1] == "document_delete"  # legacy copy removed last
     # P7-8: both deletes are keyed by the GM document_id resolved from
     # document_list — never by filename (the real GM tool rejects filenames).
     delete_args = inst.args_for("document_delete")
@@ -450,8 +454,8 @@ async def test_push_byte_for_byte() -> None:
         "uuid-stale",
     ]
     assert all("filename" not in a for a in delete_args)
-    # ingest content is base64-encoded.
-    ingest_args = inst.args_for("memory_ingest")
+    # ingest content is base64-encoded, keyed by the mirror source_path + sha256.
+    ingest_args = inst.args_for("memory_ingest_async")
     encoded = {a["filename"]: a["content_base64"] for a in ingest_args}
     assert encoded["systemPatterns.md"] == base64.b64encode(b"patterns").decode("ascii")
     # metrics dict shape unchanged.

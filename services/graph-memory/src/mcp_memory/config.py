@@ -140,6 +140,10 @@ class Settings(BaseSettings):
     mcp_server_debug: bool = False
     mcp_server_name: str = "mcp-memory"
     mcp_request_max_bytes: int = Field(default=75 * 1024 * 1024, ge=1)
+    # SDK 2 session limits, explicit (same names as the core runtime): open
+    # stateful sessions per process, and idle close after no request in flight.
+    mcp_max_sessions: int = Field(default=10000, ge=1)
+    mcp_session_idle_timeout_seconds: float = Field(default=1800.0, gt=0)
     
     # =========================================================================
     # Admin / Auth
