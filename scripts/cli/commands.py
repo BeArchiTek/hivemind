@@ -124,6 +124,7 @@ def _run_token_create(
     space_ids,
     expires_in_days,
     email,
+    operator_tools=None,
     json_flag=False,
 ):
     """Route token creation from the caller's live capability, not target shape.
@@ -180,6 +181,13 @@ def _run_token_create(
                 "--space-ids cannot be combined with an admin target. Admin "
                 "access is global and token-store v2 persists space_ids=[]."
             )
+        if not is_global_admin and operator_tools is not None:
+            raise click.UsageError(
+                "--operator-tools/--no-operator-tools requires an admin/bootstrap "
+                "caller. A manager-created token always refuses operator tools "
+                "over MCP; an admin can change it later with "
+                "`token update <hash> --operator-tools true`."
+            )
 
         tool_name = "admin_create_token" if is_global_admin else "token_create"
         args = {
@@ -190,6 +198,8 @@ def _run_token_create(
         }
         if is_global_admin:
             args["space_ids"] = space_ids
+            if operator_tools is not None:
+                args["operator_tools"] = operator_tools
         try:
             result = await client.call_tool(tool_name, args)
         except Exception as exc:
@@ -1048,9 +1058,22 @@ VALID_PERMISSIONS = click.Choice(
     help="Expiration (0=never)",
 )
 @click.option("--email", "-e", default="", help="Owner email")
+@click.option(
+    "--operator-tools/--no-operator-tools",
+    "operator_tools",
+    default=None,
+    help=(
+        "Admin/bootstrap caller only: whether the token may call operator "
+        "tools (maintenance, backup, token tools) over MCP. Server default is "
+        "allowed; use --no-operator-tools for a token handed to an agent. "
+        "Manager-created tokens always refuse."
+    ),
+)
 @click.option("--json", "-j", "jflag", is_flag=True)
 @click.pass_context
-def token_create_cmd(ctx, name, permissions, space_ids, expires_in_days, email, jflag):
+def token_create_cmd(
+    ctx, name, permissions, space_ids, expires_in_days, email, operator_tools, jflag
+):
     """Create a token (manage; admin profile requires admin permission).
 
     \b
@@ -1059,6 +1082,7 @@ def token_create_cmd(ctx, name, permissions, space_ids, expires_in_days, email, 
       token create bot-ci --permissions read
       token create ops-maint -p read,write,manage
       token create admin-ops -p read,write,manage,admin
+      token create agent-worker -p read,write --no-operator-tools
 
     \b
     Available permissions:
@@ -1074,6 +1098,7 @@ def token_create_cmd(ctx, name, permissions, space_ids, expires_in_days, email, 
         space_ids=space_ids,
         expires_in_days=expires_in_days,
         email=email,
+        operator_tools=operator_tools,
         json_flag=jflag,
     )
 
@@ -1116,12 +1141,29 @@ def token_create_cmd(ctx, name, permissions, space_ids, expires_in_days, email, 
     ),
 )
 @click.option("--email", "-e", default="", help="Owner email")
+@click.option(
+    "--operator-tools",
+    type=click.Choice(["true", "false"], case_sensitive=False),
+    default=None,
+    help=(
+        "Whether the token may call operator tools (maintenance, backup, "
+        "token tools) over MCP: true or false."
+    ),
+)
 @click.option("--json", "-j", "jflag", is_flag=True)
 @click.pass_context
 def token_update_cmd(
-    ctx, token_hash, permissions, space_ids, add_spaces, remove_spaces, email, jflag
+    ctx,
+    token_hash,
+    permissions,
+    space_ids,
+    add_spaces,
+    remove_spaces,
+    email,
+    operator_tools,
+    jflag,
 ):
-    """✏️  Update a token (permissions, spaces, email).
+    """✏️  Update a token (permissions, spaces, email, operator tools).
 
     \b
     Examples:
@@ -1130,6 +1172,7 @@ def token_update_cmd(
       token update sha256:a8c5 -s "my-project"                 # replaces
       token update sha256:a8c5 -a "new-space"                  # adds (delta)
       token update sha256:a8c5 -a "new-a,new-b" -r "old"       # mixed delta
+      token update sha256:a8c5 --operator-tools false          # agent token
     """
     if (
         not permissions
@@ -1137,10 +1180,11 @@ def token_update_cmd(
         and not add_spaces
         and not remove_spaces
         and not email
+        and operator_tools is None
     ):
         show_error(
             "Nothing to update. Use --permissions, --space-ids, "
-            "--add-spaces, --remove-spaces and/or --email."
+            "--add-spaces, --remove-spaces, --email and/or --operator-tools."
         )
         return
 
@@ -1163,6 +1207,8 @@ def token_update_cmd(
         args["space_ids_remove"] = remove_spaces
     if email:
         args["email"] = email
+    if operator_tools is not None:
+        args["operator_tools"] = operator_tools.lower()
     _run_tool(
         ctx,
         "admin_update_token",
@@ -1269,6 +1315,15 @@ def token_list_cmd(ctx, name_contains, has_space, no_revoked, jflag):
     ),
 )
 @click.option(
+    "--operator-tools",
+    type=click.Choice(["true", "false"], case_sensitive=False),
+    default=None,
+    help=(
+        "Whether the selected tokens may call operator tools (maintenance, "
+        "backup, token tools) over MCP: true or false."
+    ),
+)
+@click.option(
     "--confirm",
     is_flag=True,
     default=False,
@@ -1286,6 +1341,7 @@ def token_bulk_update_cmd(
     permissions,
     email,
     include_revoked,
+    operator_tools,
     confirm,
     jflag,
 ):
@@ -1299,12 +1355,15 @@ def token_bulk_update_cmd(
     Filters (at least one required) :
       --names, --name-contains, --has-space
     Operations (at least one required):
-      --add-spaces, --remove-spaces, --permissions, --email
+      --add-spaces, --remove-spaces, --permissions, --email, --operator-tools
 
     \b
     Examples:
       # Add "new-project" to all agents
       token bulk-update --name-contains agent --add-spaces new-project --confirm
+
+      # Refuse operator tools over MCP to every agent token
+      token bulk-update --name-contains agent --operator-tools false --confirm
 
       # Remove "old-project" from ALL tokens that have it
       token bulk-update --has-space old-project --remove-spaces old-project --confirm
@@ -1324,10 +1383,10 @@ def token_bulk_update_cmd(
             "See 'token bulk-update --help' for examples."
         )
         return
-    if not (add_spaces or remove_spaces or permissions or email):
+    if not (add_spaces or remove_spaces or permissions or email or operator_tools):
         show_error(
             "At least one operation required: --add-spaces, --remove-spaces, "
-            "--permissions or --email."
+            "--permissions, --email or --operator-tools."
         )
         return
 
@@ -1393,6 +1452,8 @@ def token_bulk_update_cmd(
         args["permissions"] = permissions
     if email:
         args["email"] = email
+    if operator_tools:
+        args["operator_tools"] = operator_tools.lower()
 
     def _on_success(result):
         from .display import show_bulk_update_result

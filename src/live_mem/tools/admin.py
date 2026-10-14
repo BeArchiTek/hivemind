@@ -82,6 +82,18 @@ def register(mcp: MCPServer) -> int:
                 default="", description="Optional owner email for traceability"
             ),
         ] = "",
+        operator_tools: Annotated[
+            bool,
+            Field(
+                default=True,
+                description=(
+                    "Whether the token may call operator tools (the hidden "
+                    "maintenance, backup and token tools) over MCP. Default "
+                    "true for an operator credential; pass false for a token "
+                    "handed to an agent."
+                ),
+            ),
+        ] = True,
     ) -> dict:
         """
         Create an authentication token.
@@ -96,9 +108,11 @@ def register(mcp: MCPServer) -> int:
                 ``*`` or ``all`` captures current spaces. Admin scope is global.
             expires_in_days: Validity period in days; 0 means no expiration.
             email: Optional owner email.
+            operator_tools: Whether the token may call operator tools over
+                MCP; default true, pass false for an agent token.
 
         Returns:
-            Plaintext token, permissions, and expiration. A
+            Plaintext token, permissions, expiration and ``operator_tools``. A
             ``warning_no_access`` field is included when a non-admin token has
             no access to an existing space.
         """
@@ -116,6 +130,7 @@ def register(mcp: MCPServer) -> int:
                 space_ids=space_ids,
                 expires_in_days=expires_in_days,
                 email=email,
+                operator_tools=operator_tools,
             )
         except Exception as e:
             from ..auth.context import safe_error
@@ -444,9 +459,20 @@ def register(mcp: MCPServer) -> int:
                 ),
             ),
         ] = "",
+        operator_tools: Annotated[
+            str,
+            Field(
+                default="",
+                description=(
+                    "'true' lets the token call operator tools over MCP, "
+                    "'false' refuses them. Empty leaves the setting unchanged."
+                ),
+            ),
+        ] = "",
     ) -> dict:
         """
-        Update a token's permissions, email, or space scope.
+        Update a token's permissions, email, space scope or operator tool
+        access.
 
         Space scope has three modes:
 
@@ -464,9 +490,12 @@ def register(mcp: MCPServer) -> int:
             email: New email; empty leaves it unchanged.
             space_ids_add: Comma-separated spaces to add.
             space_ids_remove: Comma-separated spaces to remove.
+            operator_tools: 'true' or 'false'; empty leaves it unchanged.
 
         Returns:
-            Updated scope details and a warning when the token has no access.
+            Updated scope details, ``operator_tools_before`` and
+            ``operator_tools_after`` when that setting changed, and a warning
+            when the token has no access.
         """
         from ..auth.context import check_admin_permission
         from ..core.tokens import get_token_service
@@ -483,6 +512,7 @@ def register(mcp: MCPServer) -> int:
                 email=email,
                 space_ids_add=space_ids_add,
                 space_ids_remove=space_ids_remove,
+                operator_tools=operator_tools,
             )
         except Exception as e:
             from ..auth.context import safe_error
@@ -574,6 +604,17 @@ def register(mcp: MCPServer) -> int:
                 ),
             ),
         ] = False,
+        operator_tools: Annotated[
+            str,
+            Field(
+                default="",
+                description=(
+                    "'true' lets the selected tokens call operator tools over "
+                    "MCP, 'false' refuses them. Empty leaves the setting "
+                    "unchanged."
+                ),
+            ),
+        ] = "",
     ) -> dict:
         """
         Update multiple tokens in one operation.
@@ -591,9 +632,10 @@ def register(mcp: MCPServer) -> int:
         tokens are skipped by default; set ``include_revoked=True`` to update
         them explicitly.
 
-        At least one update operation is required. Permission and email changes
-        apply to every selected token; space additions and removals are
-        idempotent. A structured audit event is recorded after persistence.
+        At least one update operation is required. Permission, email and
+        operator tool changes apply to every selected token; space additions
+        and removals are idempotent. A structured audit event is recorded after
+        persistence.
 
         Returns:
             ``{"status": "ok", "updated": N, "tokens": [{name, hash,
@@ -618,6 +660,7 @@ def register(mcp: MCPServer) -> int:
                 space_ids_add=space_ids_add,
                 space_ids_remove=space_ids_remove,
                 include_revoked=include_revoked,
+                operator_tools=operator_tools,
             )
         except Exception as e:
             from ..auth.context import safe_error

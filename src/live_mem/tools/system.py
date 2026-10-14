@@ -237,12 +237,17 @@ def register(mcp: MCPServer) -> int:
         if token_info is None:
             return {"status": "error", "message": "Authentication required"}
 
+        from .exposure import token_allows_operator_tools
+
         result = {
             "status": "ok",
             "client_name": token_info.get("client_name", "anonymous"),
             "auth_type": token_info.get("type", "unknown"),
             "permissions": token_info.get("permissions", []),
             "allowed_spaces": token_info.get("allowed_resources", []),
+            # Effective per-token operator tool access (same reading as the
+            # guard): absent on the record or the bootstrap key means allowed.
+            "operator_tools": token_allows_operator_tools(token_info),
         }
 
         # Le hash du token authentifié est une identité de session STABLE et

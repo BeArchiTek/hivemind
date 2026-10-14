@@ -165,6 +165,23 @@ dev profile additionally publishes the MinIO web console on `:9001`):
    `space_ids: []`. `space_invite_token` is add-only and requires the caller to
    manage/access the target space. Existing global `admin_*` lifecycle remains
    admin-only.
+
+   Each token also carries `operator_tools`, which says whether it may call
+   the hidden operator tools (`mid_write`, `bank_compact`, `space_export`,
+   `backup_*`, `admin_*` and the other `audience=operator` entries of
+   [`TOOL_EXPOSURE.md`](TOOL_EXPOSURE.md)) over `/mcp` and `/api/tool`. A
+   token created with `token_create` refuses them; a token created with
+   `admin_create_token` (the CLI `token create` with an admin or bootstrap
+   caller, or the console in admin mode) allows them unless created with
+   `--no-operator-tools` / `operator_tools=false`. Tokens that existed before
+   this attribute keep calling operator tools. A refused call returns
+   `status: "forbidden"` with a message that tells the agent to ask an
+   operator, and is written to the audit log as `operator_tool_refused`. An
+   admin changes the attribute with `token update <hash> --operator-tools
+   true|false`, `token bulk-update ... --operator-tools true|false`, or the
+   console's Edit token form; the change applies on the token's next call.
+   Give the CLI and the console an operator token (allowed), and give agents
+   tokens that refuse.
 5. Switch to the invited writer and exercise canonical short/mid tools
    (`short_note`, `short_read`, own `mid_consolidate`, `mid_read`) to confirm
    round-trip persistence to the configured S3 bucket. Create a different
