@@ -18,6 +18,15 @@ Historical aliases and operator tools remain registered and callable by
 exact name, subject to their handler authorization, but are not advertised
 by regular MCP discovery.
 
+A call to an `operator` entry, by its canonical name or by any of its
+aliases, is additionally gated per bearer token: the server refuses it
+before the handler runs when the token's `operator_tools` attribute is
+`false`, returns `{"status": "forbidden", "message": ...}` and writes
+an `operator_tool_refused` audit line. Tokens created by `token_create`
+refuse; tokens created by `admin_create_token` and tokens stored before
+the attribute existed are allowed. The audience column below is the
+source of that decision; no separate name list exists.
+
 ## Complete registered surface
 
 60 registry entries cover 73 registered names.

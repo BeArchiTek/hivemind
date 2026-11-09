@@ -3,7 +3,8 @@ chantier/
 memory-bank/
 .mcp.json
 .codex/
-.claude/
+.claude/*
+!.claude/skills/
 .clinerules/
 tests/bench/
 

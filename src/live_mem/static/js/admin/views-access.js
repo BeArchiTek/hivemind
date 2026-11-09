@@ -341,6 +341,18 @@
         }).join(' ') + overflow + '</span>';
     }
 
+    // Per-token operator tool access over MCP. A record created before the
+    // attribute existed has no field and is allowed, like the server reads it.
+    function operatorToolsAllowed(token) {
+        return !(token && token.operator_tools === false);
+    }
+
+    function operatorToolsCell(token) {
+        return operatorToolsAllowed(token)
+            ? '<span class="chip">ALLOWED</span>'
+            : '<span class="text-faint">refused</span>';
+    }
+
     function isAdminToken(token) {
         return Array.isArray(token.permissions) &&
             token.permissions.indexOf('admin') !== -1;
@@ -525,7 +537,7 @@
         }
 
         var identity = (ctx && ctx.identity) || {};
-        var headers = ['Name', 'Hash', 'Status', 'Permissions', 'Space allowlist', 'Email / owner', ''];
+        var headers = ['Name', 'Hash', 'Status', 'Permissions', 'Space allowlist', 'Operator tools', 'Email / owner', ''];
         var rows = tokens.map(function (t) { return renderRow(t, identity); }).join('');
         tableEl.innerHTML = '<div class="access-token-table">' + dataTable(headers, rows) + '</div>';
     }
@@ -568,7 +580,7 @@
             esc(String(t.name || 'unnamed')) + '"><span aria-hidden="true">•••</span></summary>' +
             '<div class="row-action-menu-panel" role="group" aria-label="Token actions">' +
             '<button type="button" class="row-action-item" data-action="access-edit"' +
-            editDisabled + '><span>Edit token</span><small>Permissions, spaces, owner</small></button>' +
+            editDisabled + '><span>Edit token</span><small>Permissions, spaces, operator tools, owner</small></button>' +
             '<button type="button" class="row-action-item" data-action="access-replace">' +
             '<span>Create replacement…</span><small>' + (t.revoked ? 'Creates a new credential' : 'Old token is unchanged') + '</small></button>' +
             lifecycleItem +
@@ -585,6 +597,7 @@
             '<td>' + statusPill(t) + expiryLine(t) + '</td>' +
             '<td>' + permsChips(t.permissions) + '</td>' +
             '<td>' + spacesCell(t) + '</td>' +
+            '<td>' + operatorToolsCell(t) + '</td>' +
             '<td>' + (t.email ? esc(String(t.email)) : '<span class="text-faint">—</span>') + '</td>' +
             '<td class="cell-actions">' + actions + '</td>' +
             '</tr>';
@@ -673,6 +686,20 @@
             '<div class="access-banner">New tokens start with no space access. ' +
             'Save the Token ID, then use <strong>Invite token</strong> to grant one of your spaces.</div>';
 
+        // Operator tools over MCP (maintenance, backup, token tools). Only the
+        // admin path (admin_create_token) takes the choice; token_create always
+        // stores a refusing token and has no parameter for it.
+        var operatorToolsField = adminMode ?
+            '<div class="form-group">' +
+            '<label class="form-check"><input type="checkbox" id="ctOperatorTools" checked> ' +
+            'May call operator tools over MCP</label>' +
+            '<div class="form-hint">Leave checked for an operator credential (CLI, console). ' +
+            'Uncheck for a token handed to an agent: hidden maintenance, backup and token ' +
+            'tools are then refused over MCP and the agent is told to ask an operator.</div>' +
+            '</div>' :
+            '<div class="form-hint">Tokens created by a manager refuse operator tools over MCP. ' +
+            'An admin can change this later from Edit token.</div>';
+
         var replacementNotice = replacementFor
             ? '<div class="access-banner replacement-banner">' + icon('refresh') + '<span>Creating a replacement for <strong>' +
               esc(replacementFor) + '</strong>. ' + (prefill.replacementRevoked
@@ -705,6 +732,7 @@
             '<input class="form-input" id="ctEmail" type="email" autocomplete="off" placeholder="optional" value="' +
             esc(initialEmail) + '">' +
             '</div>' +
+            operatorToolsField +
             // Timer-free recovery for an indefinitely pending request:
             // callTool has no abort/timeout and timer-based coordination is
             // banned (§3.3.2 r5), so a stalled create could otherwise pin this modal and
@@ -821,6 +849,8 @@
         if (Number.isFinite(days) && days > 0) args.expires_in_days = days;
         var email = document.getElementById('ctEmail').value.trim();
         if (email) args.email = email;
+        var operatorToolsEl = document.getElementById('ctOperatorTools');
+        if (adminMode && operatorToolsEl && operatorToolsEl.checked === false) args.operator_tools = false;
 
         var genAtCall = _modalGen;
         // Captured to detect a session change while the create request is in
@@ -1014,7 +1044,9 @@
             hashBlock +
             '<div class="token-meta">' +
             '<span class="micro-label">Name</span> ' + esc(String(res.name || '')) + ' · ' +
-            '<span class="micro-label">Permissions</span> ' + permsChips(res.permissions) +
+            '<span class="micro-label">Permissions</span> ' + permsChips(res.permissions) + ' · ' +
+            '<span class="micro-label">Operator tools over MCP</span> ' +
+            (operatorToolsAllowed(res) ? 'allowed' : 'refused') +
             '</div>' +
             extra;
 
@@ -1400,6 +1432,7 @@
             perms: Array.isArray(token.permissions) ? token.permissions.join(',') : '',
             spaces: Array.isArray(token.space_ids) ? token.space_ids.join(',') : '',
             email: String(token.email || ''),
+            operatorTools: operatorToolsAllowed(token),
         };
     }
 
@@ -1637,6 +1670,14 @@
             '<select class="form-input" id="etPerms">' + permOptions + '</select>' +
             '</div>' +
             '<div class="form-group">' +
+            '<label class="form-label" for="etOperatorTools">Operator tools over MCP</label>' +
+            '<select class="form-input" id="etOperatorTools">' +
+            '<option value="">— no change (currently ' + (data.operatorTools === false ? 'refused' : 'allowed') + ') —</option>' +
+            '<option value="true">Allow — operator credential (CLI, console)</option>' +
+            '<option value="false">Refuse — agent token; hidden maintenance, backup and token tools are refused</option>' +
+            '</select>' +
+            '</div>' +
+            '<div class="form-group">' +
             '<label class="form-label">Space allowlist</label>' +
             '<div class="space-checks" id="etSpaceChecks">' + chips + '</div>' +
             '<div class="form-hint" id="etSpacesHint">' + esc(ALLOWLIST_NOTE) +
@@ -1685,6 +1726,8 @@
 
         var newEmail = document.getElementById('etEmail').value.trim();
         if (newEmail && newEmail !== beforeEmail) args.email = newEmail;
+        var operatorToolsSelect = document.getElementById('etOperatorTools');
+        if (operatorToolsSelect && operatorToolsSelect.value) args.operator_tools = operatorToolsSelect.value;
 
         // Compute the additive delta from checkbox state (delta mode ONLY —
         // replacement mode is never offered, §5.7).
@@ -1700,7 +1743,8 @@
             if (toRemove.length) args.space_ids_remove = toRemove.join(',');
         }
 
-        if (!args.permissions && !args.email && !args.space_ids_add && !args.space_ids_remove) {
+        if (!args.permissions && !args.email && !args.space_ids_add && !args.space_ids_remove &&
+            !args.operator_tools) {
             var noEl = document.getElementById('etErr');
             if (noEl) noEl.innerHTML = serverMessage('No changes to apply.');
             return false;
