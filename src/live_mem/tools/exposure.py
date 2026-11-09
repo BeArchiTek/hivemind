@@ -1066,7 +1066,17 @@ def operator_tool_refusal(
     _audit_operator_tool_refusal(
         name=name, canonical=canonical, cause=cause, route=route, token_info=token_info
     )
-    return dict(OPERATOR_TOOL_REFUSAL)
+    # The refusal carries its reserved ``error_kind`` (specification 001) so
+    # the same payload reaches the agent over /mcp and over /api/tool; no
+    # corrective call exists for the agent, so ``retryable`` is false.
+    from .guidance import OPERATOR_TOOLS_REFUSED_REASON, refusal, remediation
+
+    return refusal(
+        OPERATOR_TOOL_REFUSAL["message"],
+        cause,
+        status=OPERATOR_TOOL_REFUSAL["status"],
+        remediation=remediation(reason=OPERATOR_TOOLS_REFUSED_REASON, retryable=False),
+    )
 
 
 class HivemindMCPServer(MCPServer):
@@ -1077,15 +1087,37 @@ class HivemindMCPServer(MCPServer):
     (instead of monkey-patching an instance later) guarantees the low-level
     ``tools/list`` handler receives the Hivemind projection and the low-level
     ``tools/call`` handler passes through the operator tool guard.
+
+    The constructor also sends the server instructions (specification 001,
+    FR-013): when the caller passes none, ``render_instructions()`` is used,
+    so every construction site carries the same text (FR-016).
     """
 
+    def __init__(self, *args: Any, instructions: str | None = None, **kwargs: Any) -> None:
+        if instructions is None:
+            from ..instructions import render_instructions
+
+            instructions = render_instructions()
+        super().__init__(*args, instructions=instructions, **kwargs)
+
+    # Merge point with specification 002 (operator tool guard): the guard below runs first and its ``forbidden`` dict then
+    # passes through the specification 001 conversion like any other refusal,
+    # so the agent views an MCP error result with ``error_kind``
+    # ``operator_tools_refused`` or ``audience_unresolved`` (constants
+    # ``OPERATOR_TOOLS_REFUSED`` and ``AUDIENCE_UNRESOLVED`` above, not
+    # redefined elsewhere) and ``remediation.retryable`` false.
     async def call_tool(
         self,
         name: str,
         arguments: dict[str, Any],
         context: Context[Any, Any] | None = None,
     ) -> CallToolResult | InputRequiredResult:
+        from pydantic import ValidationError
+        from mcp.server.mcpserver.exceptions import ToolError
+
         from ..auth.context import get_mcp_request_token_info
+        from ..config import get_settings
+        from .guidance import payload_from_validation_error, to_call_tool_result
 
         tool = self._tool_manager.get_tool(name)
         _has_mcp_context, token_info = get_mcp_request_token_info()
@@ -1093,11 +1125,53 @@ class HivemindMCPServer(MCPServer):
             name, token_info, route="mcp", registered=tool is not None
         )
         if refusal is not None:
-            assert tool is not None  # registered=True above
-            # Rendered through the tool's own converter so the client sees the
-            # exact shape of a handler refusal.
-            return tool.fn_metadata.convert_result(refusal)
-        return await super().call_tool(name, arguments, context)
+            result: Any = refusal
+        else:
+            if context is None:
+                context = Context(mcp_server=self, subscriptions=self._subscriptions)
+            try:
+                result = await self._tool_manager.call_tool(
+                    name, arguments, context, convert_result=False
+                )
+            except ToolError as exc:
+                if not isinstance(exc.__cause__, ValidationError):
+                    raise
+                # The SDK rejected the arguments against the input schema
+                # before the handler ran: report the field names only.
+                result = payload_from_validation_error(name, exc.__cause__)
+        assert tool is not None  # the tool manager raised for an unknown name
+        converted = to_call_tool_result(
+            name, result, is_error=get_settings().mcp_refusal_is_error
+        )
+        if converted is None:
+            return tool.fn_metadata.convert_result(result)
+        payload = converted.structured_content or {}
+        self._record_tool_outcome(context, name, str(payload.get("error_kind")))
+        return converted
+
+    @staticmethod
+    def _record_tool_outcome(
+        context: Context[Any, Any] | None, name: str, error_kind: str
+    ) -> None:
+        """Write the tool outcome record into the ASGI request state (FR-030)."""
+        from .guidance import TOOL_OUTCOME_STATE_KEY, canonical_tool_name
+
+        if context is None:
+            return
+        try:
+            request = context.request_context.request
+        except ValueError:
+            return
+        scope = getattr(request, "scope", None)
+        if not isinstance(scope, dict):
+            return
+        state = scope.get("state")
+        if not isinstance(state, dict):
+            return
+        state[TOOL_OUTCOME_STATE_KEY] = {
+            "tool": canonical_tool_name(name),
+            "error_kind": error_kind,
+        }
 
     async def list_tools(self) -> list[MCPTool]:
         from ..auth.context import get_mcp_request_token_info

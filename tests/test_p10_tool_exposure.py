@@ -459,6 +459,11 @@ async def test_hidden_historical_alias_is_callable_and_refuses_identically(
     )
 
     assert allowed["status"] == "ok"
+    # Specification 001: an alias refusal is identical to the canonical one
+    # except that its remediation reason also names the canonical tool.
+    alias_reason = denied_alias["remediation"].pop("reason")
+    canonical_reason = denied_canonical["remediation"].pop("reason")
+    assert alias_reason == f"{canonical_reason} Canonical tool: short_read."
     assert denied_alias == denied_canonical
     assert denied_alias["status"] == "error"
 

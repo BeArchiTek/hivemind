@@ -79,6 +79,24 @@ async def _hive_status_label_failclosed(storage, space_id: str) -> str:
         return "unsafe"
 
 
+# Remediation of a space creation whose default rules cannot be loaded
+# (specification 001): literals and the argument name only, never a path.
+RULES_REASON = (
+    "Pass rules as the Markdown consolidation rules of the space, for "
+    "example the content of a template under RULES/ such as "
+    "live-mem.standard.memory.bank.md."
+)
+
+
+def _rules_refusal(message: str) -> dict:
+    """``missing_argument`` refusal for ``rules`` when no default applies."""
+    from ..tools.guidance import ErrorKind, argument_refusal
+
+    return argument_refusal(
+        message, kind=ErrorKind.MISSING_ARGUMENT, arguments=["rules"], reason=RULES_REASON
+    )
+
+
 class SpaceService:
     """
     Service de gestion des espaces mémoire et des notes live.
@@ -143,13 +161,10 @@ class SpaceService:
             standard_path = Path("RULES/live-mem.standard.memory.bank.md")
             rules_path = Path(get_settings().default_rules_file or standard_path)
             if not rules_path.is_file():
-                return {
-                    "status": "error",
-                    "message": f"Default rules file not found: {rules_path}",
-                }
+                return _rules_refusal(f"Default rules file not found: {rules_path}")
             rules = rules_path.read_text(encoding="utf-8")
             if not rules.strip():
-                return {"status": "error", "message": "Default rules file is empty"}
+                return _rules_refusal("Default rules file is empty")
             if hashlib.sha256(rules.encode("utf-8")).hexdigest() == STANDARD_RULES_SHA256:
                 initial_bank = STANDARD_BANK
 

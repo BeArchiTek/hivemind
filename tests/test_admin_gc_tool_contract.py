@@ -70,7 +70,7 @@ async def test_gc_negative_age_is_rejected_before_service_call() -> None:
     with patch("live_mem.core.gc.get_gc_service") as get_gc_service:
         result = await gc_tool(space_id="alpha", max_age_days=-1)
 
-    assert result == {
+    assert {k: result[k] for k in ("status", "reason", "message")} == {
         "status": "error",
         "reason": "invalid_max_age_days",
         "message": "max_age_days must be greater than or equal to 0.",

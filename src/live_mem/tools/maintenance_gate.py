@@ -19,12 +19,14 @@ from ..core.selective_maintenance import (
     validate_scope,
 )
 from .exposure import ToolOperation, exposure_by_registered_name
+from .guidance import maintenance_refusal
 
 # SHORT note writers stay admitted until the explicit ``all`` boundary; every
 # other mutation (consolidation, compaction, structural tools) closes earlier.
 SHORT_WRITE_TOOLS = frozenset({"short_note"})
-REFUSAL = {"status": "error", "error": "maintenance_admission_closed",
-           "message": "Maintenance in progress; retry later"}
+# The barrier's fixed refusal, with its guidance fields (specification 001):
+# ``error_kind`` ``maintenance_in_progress`` and a retryable ``remediation``.
+REFUSAL = maintenance_refusal()
 
 
 def _kind(canonical: str, operation: ToolOperation) -> str:

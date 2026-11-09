@@ -38,6 +38,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 logger = logging.getLogger("live_mem.gc")
 
 
+def _conflict_remediation(reason: str) -> dict:
+    """Guidance for a ``conflict`` result: retryable after the step (FR-027)."""
+    from ..tools.guidance import remediation
+
+    return remediation(reason=reason, retryable=True)
+
+
 _ELIGIBLE_SET_TOKEN_PREFIX = "gc-set-v1:"
 _ELIGIBLE_SET_TOKEN_RE = re.compile(r"^gc-set-v1:[0-9a-f]{64}$")
 _LIVE_NOTE_FILENAME_RE = re.compile(
@@ -421,6 +428,11 @@ class GCService:
                             "reason": "selected_note_set_changed",
                             "notes_processed": 0,
                             "notes_requested": note_count,
+                            "error_kind": "operation_in_progress",
+                            "remediation": _conflict_remediation(
+                                "The selected notes changed while the GC ran; "
+                                "run the dry run again and retry."
+                            ),
                         }
                         continue
 
@@ -684,6 +696,11 @@ class GCService:
                     "Deletion refused: the exact eligible-note set changed since the "
                     "dry run. Run the dry run again and confirm the new set."
                 ),
+                "error_kind": "operation_in_progress",
+                "remediation": _conflict_remediation(
+                    "Run admin_gc_notes without confirm again, then retry with "
+                    "the new expected_eligible_set_token."
+                ),
             }
 
         # First all-space route proof precedes lock acquisition.  A second proof
@@ -704,6 +721,11 @@ class GCService:
                 "message": (
                     "Deletion refused: consolidation is in progress for at least one "
                     "candidate space. Run the dry run again after it completes."
+                ),
+                "error_kind": "operation_in_progress",
+                "remediation": _conflict_remediation(
+                    "Wait for the running consolidation to finish, run the dry "
+                    "run again, then retry."
                 ),
             }
 
@@ -726,6 +748,11 @@ class GCService:
                     "message": (
                         "Deletion refused: the exact eligible-note set changed since the "
                         "dry run. Run the dry run again and confirm the new set."
+                    ),
+                    "error_kind": "operation_in_progress",
+                    "remediation": _conflict_remediation(
+                        "Run admin_gc_notes without confirm again, then retry with "
+                        "the new expected_eligible_set_token."
                     ),
                 }
 
