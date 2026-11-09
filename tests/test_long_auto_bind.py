@@ -437,6 +437,7 @@ async def test_use_embedded_replaces_legacy_override_without_ingestion_or_delete
     names = [name for inst in factory.instances for name in inst.tool_names()]
     assert names == ["system_health", "memory_list", "memory_create"]
     assert "memory_ingest" not in names
+    assert "memory_ingest_async" not in names
     assert "document_delete" not in names
     assert "memory_delete" not in names
 

@@ -30,6 +30,7 @@ import uuid
 from datetime import datetime, timezone
 
 from .storage import get_storage, inventory_object_size
+from .cancel_shield import await_shielded
 from .locks import get_lock_manager
 from .models import mask_meta_secrets
 from .memory_id import reserved_space_error
@@ -497,12 +498,19 @@ class BackupService:
                 "message": f"Space '{space_id}' already exists. Delete it first.",
             }
 
-        # Copier tous les fichiers du backup vers l'espace
-        for obj in backup_objects:
-            source_key = obj["Key"]
-            relative = source_key[len(backup_prefix) :]
-            dest_key = f"{space_id}/{relative}"
-            await storage.copy_object(source_key, dest_key)
+        # Copier tous les fichiers du backup vers l'espace. La phase de copie
+        # est protégée de l'annulation du handler (déconnexion client /
+        # notifications/cancelled en SDK 2) : elle se termine, puis
+        # l'annulation se propage. Sans cela, un space à moitié copié ferait
+        # refuser le retry ("already exists").
+        async def _copy_all() -> None:
+            for obj in backup_objects:
+                source_key = obj["Key"]
+                relative = source_key[len(backup_prefix) :]
+                dest_key = f"{space_id}/{relative}"
+                await storage.copy_object(source_key, dest_key)
+
+        await await_shielded(_copy_all())
 
         return {
             "status": "ok",

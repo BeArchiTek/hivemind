@@ -254,12 +254,15 @@ class MetricsMiddleware:
 
 
 class MCPRequestLimitMiddleware:
-    """Bound raw MCP request bytes before the SDK buffers/parses any body.
+    """Refuse an oversized MCP request from its ``Content-Length`` alone.
 
-    A receive-wrapper exception is insufficient: the SDK catches it and emits
-    a 500. Read to a bounded bytearray first, then replay the accepted body.
-    No per-chunk list is retained, and response/SSE messages pass unchanged.
-    This bounds request buffering, not aggregate process/JSON-parser memory.
+    The declared length is checked before any body byte is read, with a strict
+    decimal comparison (no huge-integer parsing). The body itself is NOT
+    buffered or copied here: chunks flow straight to the SDK, whose own
+    ``RequestBodyLimitMiddleware`` (configured with the same byte budget)
+    counts actual bytes and answers 413 for a chunked request without
+    ``Content-Length``. Buffering twice doubled peak memory per request.
+    Response/SSE messages pass unchanged. Non-``/mcp`` paths are untouched.
     """
 
     def __init__(self, app, *, max_bytes: int):
@@ -277,8 +280,9 @@ class MCPRequestLimitMiddleware:
             if name.lower() == b"content-length"
         ]
         if lengths:
-            # Do not trust framing as a substitute for counting actual bytes.
-            # Decimal comparison also avoids Python's huge-integer parsing limit.
+            # Do not trust framing as a substitute for counting actual bytes:
+            # the SDK limit still counts them. Decimal comparison also avoids
+            # Python's huge-integer parsing limit.
             length = lengths[0].strip()
             if len(lengths) != 1 or not length or not length.isdigit():
                 return await self._reject(send, 400, "Invalid Content-Length")
@@ -287,38 +291,140 @@ class MCPRequestLimitMiddleware:
             if len(length) > len(limit) or (len(length) == len(limit) and length > limit):
                 return await self._reject(send, 413, "MCP request body too large")
 
-        body = bytearray()
-        while True:
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                return
-            chunk = message.get("body", b"")
-            # Check BEFORE copying the incoming chunk into our buffer.
-            if len(chunk) > self.max_bytes - len(body):
-                return await self._reject(send, 413, "MCP request body too large")
-            body.extend(chunk)
-            if not message.get("more_body", False):
-                break
-
-        accepted_body = bytes(body)
-        del body, chunk, message
-
-        async def replay_receive():
-            nonlocal accepted_body
-            if accepted_body is not None:
-                message = {"type": "http.request", "body": accepted_body, "more_body": False}
-                accepted_body = None
-                return message
-            # The SDK's SSE disconnect listener must keep the original channel.
-            return await receive()
-
-        await self.app(scope, replay_receive, send)
+        await self.app(scope, receive, send)
 
     async def _reject(self, send, status: int, message: str):
         body = json.dumps({"error": message, "max_bytes": self.max_bytes}).encode()
         await send({
             "type": "http.response.start",
             "status": status,
+            "headers": [(b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode())],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+# =============================================================================
+# MCPSessionLimitMiddleware
+# =============================================================================
+
+
+class MCPSessionLimitMiddleware:
+    """Cap the open MCP sessions a single token may hold (F5, SDK 2).
+
+    The SDK caps sessions per process (``max_sessions``) but any one token can
+    fill that cap. This layer sits directly around the SDK app: a request that
+    would open a session (``POST /mcp`` without ``Mcp-Session-Id`` on the
+    legacy stateful path) is refused with HTTP 429 and a JSON-RPC error body
+    while the token already holds ``max_sessions_per_bearer_token`` open sessions.
+    Other tokens are unaffected.
+
+    Ownership is learned from the ``Mcp-Session-Id`` header of a successful
+    opening response. Liveness comes from the SDK's own registry
+    (``open_sessions``): a session stops counting as soon as the SDK forgets
+    it, whether the client sent ``DELETE /mcp``, the idle timeout expired or
+    the server dropped it, so the count cannot leak. Opening requests still
+    in flight are counted so concurrent initializes cannot overshoot.
+    """
+
+    def __init__(self, app, *, max_sessions_per_bearer_token: int, open_sessions):
+        if max_sessions_per_bearer_token < 0:
+            raise ValueError("MCP per-bearer-token session cap must be 0 (disabled) or positive")
+        self.app = app
+        self.max_sessions_per_bearer_token = max_sessions_per_bearer_token
+        self._open_sessions = open_sessions  # () -> live SDK session ids
+        self._owners: dict[str, str] = {}  # session id → token key
+        self._pending: dict[str, int] = {}  # token key → opening requests in flight
+
+    @staticmethod
+    def _token_key() -> str | None:
+        info = current_token_info.get()
+        if not info:
+            return None
+        return info.get("token_hash") or f"{info.get('auth_type', 'bootstrap')}:{info.get('client_name', '')}"
+
+    def _prune(self) -> None:
+        live = set(self._open_sessions())
+        for session_id in [s for s in self._owners if s not in live]:
+            del self._owners[session_id]
+
+    def held_by(self, token_key: str) -> int:
+        """Open sessions plus in-flight opening requests for ``token_key``."""
+        self._prune()
+        return (
+            sum(1 for owner in self._owners.values() if owner == token_key)
+            + self._pending.get(token_key, 0)
+        )
+
+    async def __call__(self, scope, receive, send):
+        if (
+            self.max_sessions_per_bearer_token <= 0
+            or scope["type"] != "http"
+            or scope.get("method") != "POST"
+            or not scope.get("path", "").startswith("/mcp")
+        ):
+            return await self.app(scope, receive, send)
+        headers = {name.lower(): value for name, value in scope.get("headers", [])}
+        if b"mcp-session-id" in headers:
+            return await self.app(scope, receive, send)
+        protocol_version = headers.get(b"mcp-protocol-version")
+        if protocol_version is not None:
+            from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS
+
+            if protocol_version.decode("latin-1") not in HANDSHAKE_PROTOCOL_VERSIONS:
+                # Modern (2026-07-28) stateless request: opens no session.
+                return await self.app(scope, receive, send)
+        token_key = self._token_key()
+        if token_key is None:
+            return await self.app(scope, receive, send)
+
+        if self.held_by(token_key) >= self.max_sessions_per_bearer_token:
+            logger.warning(
+                "Refusing a new MCP session: token already holds %d open sessions",
+                self.max_sessions_per_bearer_token,
+            )
+            return await self._reject(send)
+
+        self._pending[token_key] = self._pending.get(token_key, 0) + 1
+        session_id = None
+        status = None
+
+        async def watch(message):
+            nonlocal session_id, status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+                for name, value in message.get("headers", []):
+                    if name.lower() == b"mcp-session-id":
+                        session_id = value.decode("latin-1")
+            await send(message)
+
+        try:
+            await self.app(scope, receive, watch)
+        finally:
+            remaining = self._pending.get(token_key, 1) - 1
+            if remaining > 0:
+                self._pending[token_key] = remaining
+            else:
+                self._pending.pop(token_key, None)
+            if session_id and status is not None and status < 400:
+                self._owners[session_id] = token_key
+
+    async def _reject(self, send):
+        body = json.dumps({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {
+                "code": -32000,
+                "message": (
+                    "Too many open MCP sessions for this token "
+                    f"(max {self.max_sessions_per_bearer_token}); close one with "
+                    "DELETE /mcp or wait for the idle timeout"
+                ),
+            },
+        }).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 429,
             "headers": [(b"content-type", b"application/json"),
                         (b"content-length", str(len(body)).encode())],
         })
